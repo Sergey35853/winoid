@@ -484,7 +484,7 @@ function Initialize-WinoidData {
 # Optional config: %LOCALAPPDATA%\Winoid\config.json
 # { "wslDistro": "Winoid", "adbSerial": "192.168.240.112:5555" }
 $script:dataRoot = Initialize-WinoidData
-$script:appVersion = '0.1.31'
+$script:appVersion = '0.1.32'
 $script:iconQueue = New-Object System.Collections.Queue
 $script:geometryPath = Join-Path $script:dataRoot 'geometry.json'
 $script:appGeometry = @{}
@@ -3346,13 +3346,6 @@ $script:frameTimer.Add_Tick({
                         ($w.Window.IsActive -or (($w.Frames % 20) -eq 0)))
             $lumaSum = 0.0
             $lumaRows = 0
-            # Start all captures first: PrintWindow runs on thread-pool threads
-            # so the WPF dispatcher is free while the pixels are being read.
-            if ($capture) {
-                foreach ($p in @($w.Panes)) {
-                    if ($null -ne $p -and [NativeWin]::IsWindow($p.Source)) { [void]$p.Grab.CaptureBegin($p.Source) }
-                }
-            }
             foreach ($pane in @($w.Panes)) {
                 if ($null -eq $pane -or -not [NativeWin]::IsWindow($pane.Source)) { continue }
                 if ([NativeWin]::IsIconic($pane.Source)) {
@@ -3381,7 +3374,7 @@ $script:frameTimer.Add_Tick({
                 $ecProp = $pane.PSObject.Properties['EdgeCrop']
                 $ec = 0
                 if ($null -ne $ecProp) { $ec = [int]$ecProp.Value }
-                if (-not $pane.Grab.CaptureComplete()) { continue }
+                [void]$pane.Grab.Capture($pane.Source)
                 $srcRect = [System.Windows.Int32Rect]::new($cx + $ec, $cy + $capPx + $ec, [Math]::Max(1, $vw - 2 * $ec), [Math]::Max(1, $vh - 2 * $ec))
                 $w.Wb.WritePixels($srcRect, $pane.Grab.Bits, [int]$pane.Grab.ByteSize, $pane.Grab.Stride, [int]$pane.VX, [int]$pane.VY)
                 $lumaSum += $pane.Grab.MeanLuma() * $vh
@@ -3453,6 +3446,7 @@ $script:frameTimer.Add_Tick({
                 if ($elapsed -ge 1.5 -and (($lumaSum / $lumaRows) -ge 1 -or $elapsed -ge 6)) {
                     $w.Settled = $true
                     $w.Loading.Visibility = 'Collapsed'
+                    Write-WinoidLog ("wrapper settled: $($w.Package) frames=$($w.Frames)")
                 } elseif ($elapsed -ge 10 -and $w.LoadPhase -lt 1) {
                     $w.LoadPhase = 1
                     $w.LoadingText.Text = 'Приложение ещё загружается…'
