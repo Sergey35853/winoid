@@ -31,7 +31,8 @@ foreach ($needle in @(
     '$script:hideCaption = $false', 'x:Name="NavInsetCheck"', 'fallbackNavInset', 'EdgeCrop',
     'sub-surface', 'letterbox', 'StretchFillCheck', 'GameModeBtn',
     'script:appGeometry', 'NotifyIcon', 'DiagFilter', 'exec sleep 86400',
-    'x:Name="LangBtn"', 'script:translations', 'script:profilesPath', 'x:Name="ProfileBox"'
+    'x:Name="LangBtn"', 'script:translations', 'script:profilesPath', 'x:Name="ProfileBox"',
+    'Start-StartupProbe', 'CaptureBegin', 'Task.Run'
 )) {
     Assert-True ($text.Contains($needle)) "contains: $needle"
 }

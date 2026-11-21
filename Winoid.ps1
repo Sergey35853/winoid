@@ -10,6 +10,7 @@ Add-Type -AssemblyName PresentationFramework, PresentationCore, WindowsBase, Sys
 Add-Type -TypeDefinition @"
 using System;
 using System.Text;
+using System.Threading.Tasks;
 using System.Runtime.InteropServices;
 public class WinoidActivate {
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindow(string cls, string title);
@@ -68,6 +69,7 @@ using System.Collections.Generic;
 using System.Diagnostics;
 using System.Runtime.InteropServices;
 using System.Text;
+using System.Threading.Tasks;
 
 public class NativeWin {
     [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr lp);
@@ -189,6 +191,8 @@ public class FrameGrabber : IDisposable {
     public readonly int W, H, Stride, ByteSize;
     IntPtr _memDc, _dib, _old, _screenDc, _bits;
     public long LastMs;
+    Task<bool> _capture;
+    IntPtr _captureHwnd;
 
     public FrameGrabber(int w, int h) {
         W = w; H = h; Stride = w * 4; ByteSize = Stride * h;
@@ -211,6 +215,29 @@ public class FrameGrabber : IDisposable {
         var sw = Stopwatch.StartNew();
         bool ok = NativeWin.PrintWindow(hwnd, _memDc, 2);
         LastMs = sw.ElapsedMilliseconds;
+        return ok;
+    }
+
+    // PrintWindow can take tens of milliseconds. Start it on a thread-pool
+    // thread so the WPF dispatcher is never blocked by the capture itself.
+    public bool CaptureBegin(IntPtr hwnd) {
+        if (_capture != null && !_capture.IsCompleted) return false;
+        _captureHwnd = hwnd;
+        var dc = _memDc;
+        _capture = Task.Run(() => {
+            var sw = Stopwatch.StartNew();
+            bool ok = NativeWin.PrintWindow(_captureHwnd, dc, 2);
+            LastMs = sw.ElapsedMilliseconds;
+            return ok;
+        });
+        return true;
+    }
+
+    public bool CaptureComplete() {
+        if (_capture == null || !_capture.IsCompleted) return false;
+        bool ok;
+        try { ok = _capture.Result; } catch { ok = false; }
+        _capture = null;
         return ok;
     }
 
@@ -269,6 +296,7 @@ public class FrameGrabber : IDisposable {
     }
 
     public void Dispose() {
+        if (_capture != null) { try { _capture.Wait(500); } catch { } }
         try { NativeWin.SelectObject(_memDc, _old); } catch { }
         try { NativeWin.DeleteObject(_dib); } catch { }
         try { NativeWin.DeleteDC(_memDc); } catch { }
@@ -447,7 +475,7 @@ function Initialize-WinoidData {
 # Optional config: %LOCALAPPDATA%\Winoid\config.json
 # { "wslDistro": "Winoid", "adbSerial": "192.168.240.112:5555" }
 $script:dataRoot = Initialize-WinoidData
-$script:appVersion = '0.1.26'
+$script:appVersion = '0.1.27'
 $script:iconQueue = New-Object System.Collections.Queue
 $script:geometryPath = Join-Path $script:dataRoot 'geometry.json'
 $script:appGeometry = @{}
@@ -3298,6 +3326,13 @@ $script:frameTimer.Add_Tick({
                         ($w.Window.IsActive -or (($w.Frames % 20) -eq 0)))
             $lumaSum = 0.0
             $lumaRows = 0
+            # Start all captures first: PrintWindow runs on thread-pool threads
+            # so the WPF dispatcher is free while the pixels are being read.
+            if ($capture) {
+                foreach ($p in @($w.Panes)) {
+                    if ($null -ne $p -and [NativeWin]::IsWindow($p.Source)) { [void]$p.Grab.CaptureBegin($p.Source) }
+                }
+            }
             foreach ($pane in @($w.Panes)) {
                 if ($null -eq $pane -or -not [NativeWin]::IsWindow($pane.Source)) { continue }
                 if ([NativeWin]::IsIconic($pane.Source)) {
@@ -3326,7 +3361,7 @@ $script:frameTimer.Add_Tick({
                 $ecProp = $pane.PSObject.Properties['EdgeCrop']
                 $ec = 0
                 if ($null -ne $ecProp) { $ec = [int]$ecProp.Value }
-                [void]$pane.Grab.Capture($pane.Source)
+                if (-not $pane.Grab.CaptureComplete()) { continue }
                 $srcRect = [System.Windows.Int32Rect]::new($cx + $ec, $cy + $capPx + $ec, [Math]::Max(1, $vw - 2 * $ec), [Math]::Max(1, $vh - 2 * $ec))
                 $w.Wb.WritePixels($srcRect, $pane.Grab.Bits, [int]$pane.Grab.ByteSize, $pane.Grab.Stride, [int]$pane.VX, [int]$pane.VY)
                 $lumaSum += $pane.Grab.MeanLuma() * $vh
