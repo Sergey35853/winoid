@@ -484,7 +484,7 @@ function Initialize-WinoidData {
 # Optional config: %LOCALAPPDATA%\Winoid\config.json
 # { "wslDistro": "Winoid", "adbSerial": "192.168.240.112:5555" }
 $script:dataRoot = Initialize-WinoidData
-$script:appVersion = '0.1.37'
+$script:appVersion = '0.1.38'
 $script:iconQueue = New-Object System.Collections.Queue
 $script:geometryPath = Join-Path $script:dataRoot 'geometry.json'
 $script:appGeometry = @{}
@@ -1970,6 +1970,12 @@ function Apply-AppListResult($result) {
         $cached = $true
     }
     Update-AppFilter
+    if ($result.Count -eq 0 -and @($script:apps).Count -eq 0) {
+        # The job could not reach Waydroid; offer the backend setup button.
+        $backendBtn.Visibility = 'Visible'
+    } else {
+        $backendBtn.Visibility = 'Collapsed'
+    }
     Write-WinoidLog ("app list (async): " + $script:apps.Count + " apps, queued icons=" + $script:iconQueue.Count)
     if ($script:apps.Count -eq 0) {
         Set-Footer 'Список пуст. Android ещё запускается? Нажмите «Обновить».'
@@ -2229,7 +2235,11 @@ function Initialize-Adb {
     }
 }
 
+$script:displayOverridden = $false
 function Set-AndroidDisplay([string]$sizeArg, [string]$densityArg) {
+    # A frozen container makes every adb call hang until its timeout.
+    Ensure-WaydroidAwake | Out-Null
+    if ($densityArg -ne 'reset') { $script:displayOverridden = $true }
     # Use a fresh adb client: the persistent shell can be stale after a
     # Waydroid session restart and silently swallow commands.
     try {
@@ -4601,6 +4611,9 @@ $window.Add_Closing({
     $script:exiting = $true
     $stack = @(Get-PSCallStack | ForEach-Object { "$($_.Command):$($_.ScriptLineNumber)" }) -join ' <- '
     Write-WinoidLog ("manager closing (user=" + $script:quitByUser + ") stack=" + $stack)
+    if ($script:displayOverridden) {
+        try { $null = Invoke-Wsl ((Get-WslBase) + @('--', 'adb', '-s', $script:adbSerial, 'shell', 'wm', 'density', 'reset')) 8000 } catch { }
+    }
     try { if ($null -ne $script:tray) { $script:tray.Visible = $false; $script:tray.Dispose() } } catch { }
     try { if ($script:quitByUser) { [System.IO.File]::WriteAllText($script:quitPath, (Get-Date).ToString('o')) } } catch { }
     try { [System.IO.File]::WriteAllText($script:shutdownPath, (Get-Date).ToString('o')) } catch { }

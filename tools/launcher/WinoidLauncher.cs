@@ -55,6 +55,8 @@ namespace Winoid {
                 first = false;
                 try {
                     string log = Path.Combine(data, "launcher.log");
+                    var fi = new FileInfo(log);
+                    if (fi.Exists && fi.Length > 1048576) File.Delete(log);
                     File.AppendAllText(log, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") +
                         " manager exited; restart=" + !File.Exists(quit) + Environment.NewLine);
                 } catch { }
