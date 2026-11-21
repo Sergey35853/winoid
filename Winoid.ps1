@@ -447,9 +447,9 @@ function Initialize-WinoidData {
 # Optional config: %LOCALAPPDATA%\Winoid\config.json
 # { "wslDistro": "Winoid", "adbSerial": "192.168.240.112:5555" }
 $script:dataRoot = Initialize-WinoidData
-$script:appVersion = '0.1.19'
+$script:appVersion = '0.1.20'
 $script:iconQueue = New-Object System.Collections.Queue
-$script:hideCaption = $true
+$script:hideCaption = $false
 $script:captionHeightPx = 48
 $script:adbTimeoutMs = 10000
 $script:sessionTimeoutMs = 15000
@@ -818,7 +818,7 @@ $mainXaml = @'
         </ComboBox>
         <CheckBox x:Name="RememberModeCheck" Content="Запоминать режим для каждого приложения" Foreground="#C9CDD4" Margin="2,0,0,12"/>
         <CheckBox x:Name="AutoHideCheck" Content="Скрывать индикатор после появления окна" Foreground="#C9CDD4" IsChecked="True" Margin="2,0,0,14"/>
-        <CheckBox x:Name="HideCaptionCheck" Content="Скрывать заголовок Android (стрелка и кнопки окна)" Foreground="#C9CDD4" IsChecked="True" Margin="2,0,0,4"/>
+        <CheckBox x:Name="HideCaptionCheck" Content="Обрезать заголовок Android (обычно не нужно)" Foreground="#C9CDD4" IsChecked="False" Margin="2,0,0,4"/>
         <CheckBox x:Name="ArmCompatCheck" Content="Режим совместимости ARM" Foreground="#C9CDD4" Margin="2,0,0,4"/>
         <TextBlock x:Name="ArmCompatHint" Text="Помогает играм, которые зависают в ARM-трансляторе libndk. Медленнее, но надёжнее." TextWrapping="Wrap" FontSize="11" Foreground="#8D929C" Margin="24,0,0,14"/>
         <TextBlock x:Name="HintText" TextWrapping="Wrap" FontSize="12" Foreground="#A9AEBA"

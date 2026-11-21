@@ -27,7 +27,8 @@ foreach ($needle in @(
     'function Set-LiveDisplayMode', 'function Get-AppIconPath', 'function Show-Diagnostics',
     'function Restart-WaydroidSession', 'LaunchCmd = ', 'force-stop',
     'x:Name="HideCaptionCheck"', 'CaptionInset', 'function Restore-OrphanedParkedWindows',
-    '$dy = $dir * $mag * 150', 'parked late surface'
+    '$dy = $dir * $mag * 150', 'parked late surface',
+    '$script:hideCaption = $false'
 )) {
     Assert-True ($text.Contains($needle)) "contains: $needle"
 }
