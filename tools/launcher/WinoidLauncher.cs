@@ -53,6 +53,11 @@ namespace Winoid {
                 proc.WaitForExit();
                 proc.Dispose();
                 first = false;
+                try {
+                    string log = Path.Combine(data, "launcher.log");
+                    File.AppendAllText(log, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") +
+                        " manager exited; restart=" + !File.Exists(quit) + Environment.NewLine);
+                } catch { }
                 Thread.Sleep(2500);
 
                 bool clean = false;
