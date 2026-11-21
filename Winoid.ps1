@@ -475,7 +475,7 @@ function Initialize-WinoidData {
 # Optional config: %LOCALAPPDATA%\Winoid\config.json
 # { "wslDistro": "Winoid", "adbSerial": "192.168.240.112:5555" }
 $script:dataRoot = Initialize-WinoidData
-$script:appVersion = '0.1.29'
+$script:appVersion = '0.1.30'
 $script:iconQueue = New-Object System.Collections.Queue
 $script:geometryPath = Join-Path $script:dataRoot 'geometry.json'
 $script:appGeometry = @{}
@@ -1253,7 +1253,7 @@ try {
     $menu = New-Object System.Windows.Forms.ContextMenuStrip
     [void]$menu.Items.Add('Показать Winoid', $null, { param($s,$e) $window.Show(); $window.Activate() })
     [void]$menu.Items.Add('Диагностика', $null, { param($s,$e) Show-Diagnostics })
-    [void]$menu.Items.Add('Выход', $null, { param($s,$e) $window.Close() })
+    [void]$menu.Items.Add('Выход', $null, { param($s,$e) $script:quitByUser = $true; $window.Close() })
     $script:tray.ContextMenuStrip = $menu
     $script:tray.Visible = $true
 } catch { }
@@ -1373,6 +1373,8 @@ $window.Dispatcher.Add_UnhandledException({
 # without a clean shutdown request. The heartbeat proves we were alive.
 $script:heartbeatPath = Join-Path $script:dataRoot 'heartbeat'
 $script:shutdownPath = Join-Path $script:dataRoot 'shutdown.request'
+$script:quitPath = Join-Path $script:dataRoot 'quit.request'
+$script:quitByUser = $false
 $script:lastHeartbeat = [DateTime]::MinValue
 try { Remove-Item -LiteralPath $script:shutdownPath -Force -ErrorAction SilentlyContinue } catch { }
 
@@ -4548,8 +4550,9 @@ $window.Add_Drop({
 })
 $window.Add_Closing({
     $script:exiting = $true
-    Write-WinoidLog 'manager closing (clean shutdown)'
+    Write-WinoidLog ("manager closing (user=" + $script:quitByUser + ")")
     try { if ($null -ne $script:tray) { $script:tray.Visible = $false; $script:tray.Dispose() } } catch { }
+    try { if ($script:quitByUser) { [System.IO.File]::WriteAllText($script:quitPath, (Get-Date).ToString('o')) } } catch { }
     try { [System.IO.File]::WriteAllText($script:shutdownPath, (Get-Date).ToString('o')) } catch { }
     Invoke-Safe 'closing.timers' {
         $launchTimer.Stop()

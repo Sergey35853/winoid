@@ -17,7 +17,7 @@ namespace Winoid {
             string data = Path.Combine(Environment.GetFolderPath(
                 Environment.SpecialFolder.LocalApplicationData), "Winoid");
             try { Directory.CreateDirectory(data); } catch { }
-            string shutdown = Path.Combine(data, "shutdown.request");
+            string quit = Path.Combine(data, "quit.request");
 
             if (!File.Exists(script)) {
                 MessageBox.Show("Winoid.ps1 not found in " + dir, "Winoid",
@@ -26,7 +26,7 @@ namespace Winoid {
             }
 
             for (;;) {
-                try { if (File.Exists(shutdown)) File.Delete(shutdown); } catch { }
+                try { if (File.Exists(quit)) File.Delete(quit); } catch { }
 
                 Process proc;
                 try {
@@ -51,7 +51,7 @@ namespace Winoid {
                 Thread.Sleep(2500);
 
                 bool clean = false;
-                try { clean = File.Exists(shutdown); } catch { }
+                try { clean = File.Exists(quit); } catch { }
                 if (clean) break;
             }
         }
