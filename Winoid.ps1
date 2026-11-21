@@ -447,7 +447,7 @@ function Initialize-WinoidData {
 # Optional config: %LOCALAPPDATA%\Winoid\config.json
 # { "wslDistro": "Winoid", "adbSerial": "192.168.240.112:5555" }
 $script:dataRoot = Initialize-WinoidData
-$script:appVersion = '0.1.22'
+$script:appVersion = '0.1.23'
 $script:iconQueue = New-Object System.Collections.Queue
 $script:hideCaption = $false
 $script:captionHeightPx = 48
@@ -1970,9 +1970,11 @@ function Map-WrapperPoint($w, $pos) {
     $oy = ($ch - $w.SrcH * $scale) / 2
     $fx = ($pos.X - $ox) / $scale
     $fy = ($pos.Y - $oy) / $scale
-    # Clicks in the black letterbox around the image are not taps at the
-    # nearest Android edge; ignore them entirely.
-    if ($fx -lt 0 -or $fy -lt 0 -or $fx -ge $w.SrcW -or $fy -ge $w.SrcH) { return $null }
+    # Taps in the black letterbox around the image are mapped to the nearest
+    # content edge instead of being ignored, so the top/bottom strip of the
+    # wrapper still controls the app.
+    $fx = [Math]::Max(0, [Math]::Min([double]($w.SrcW - 1), $fx))
+    $fy = [Math]::Max(0, [Math]::Min([double]($w.SrcH - 1), $fy))
     $sx = [int][math]::Floor($fx)
     $sy = [int][math]::Floor($fy)
     foreach ($pane in @($w.Panes)) {
@@ -3020,7 +3022,11 @@ $script:frameTimer.Add_Tick({
                     try { $late = @([NativeWin]::ListWindows([uint32]$proc.Id)) } catch { }
                     foreach ($wnd in $late) {
                         if ($null -eq $wnd -or -not $wnd.Visible) { continue }
-                        if ($wnd.Width -lt 40 -or $wnd.Height -lt 40) { continue }
+                        # Only park a full-size copy of the app window (the one
+                        # carrying the gray caption). Small sub-surfaces belong
+                        # to the game's own rendering and must stay untouched.
+                        if ($wnd.Title -match 'sub-surface') { continue }
+                        if ($wnd.Width -lt [int]($w.SrcW * 0.7) -or $wnd.Height -lt [int]($w.SrcH * 0.7)) { continue }
                         if ($known.Contains($wnd.Hwnd)) { continue }
                         if ([NativeWin]::GetAncestor($wnd.Hwnd, 3) -ne $rootOwner) { continue }
                         $lr = New-Object NativeWin+RECT
