@@ -475,7 +475,7 @@ function Initialize-WinoidData {
 # Optional config: %LOCALAPPDATA%\Winoid\config.json
 # { "wslDistro": "Winoid", "adbSerial": "192.168.240.112:5555" }
 $script:dataRoot = Initialize-WinoidData
-$script:appVersion = '0.1.27'
+$script:appVersion = '0.1.28'
 $script:iconQueue = New-Object System.Collections.Queue
 $script:geometryPath = Join-Path $script:dataRoot 'geometry.json'
 $script:appGeometry = @{}
@@ -1972,6 +1972,7 @@ function Apply-AppListResult($result) {
 # The WSL/ADB work runs in a background job; the dispatcher only applies the
 # finished list, so the manager window never freezes while it is read.
 $script:appsJob = $null
+$script:appsJobStart = [DateTime]::UtcNow
 $appsRefreshTimer = [System.Windows.Threading.DispatcherTimer]::new()
 $appsRefreshTimer.Interval = [TimeSpan]::FromMilliseconds(250)
 $appsRefreshTimer.Add_Tick({
@@ -1979,7 +1980,12 @@ $appsRefreshTimer.Add_Tick({
         if ($null -eq $script:appsJob) { $appsRefreshTimer.Stop(); return }
         $state = 'Unknown'
         try { $state = [string]$script:appsJob.State } catch { }
-        if ($state -notin @('Completed', 'Failed', 'Stopped')) { return }
+        if ($state -notin @('Completed', 'Failed', 'Stopped')) {
+            if (([DateTime]::UtcNow - $script:appsJobStart).TotalSeconds -gt 60) {
+                Write-WinoidLog 'app list job timed out; using cache'
+                try { Stop-Job -Job $script:appsJob -Force -ErrorAction SilentlyContinue } catch { }
+            } else { return }
+        }
         $appsRefreshTimer.Stop()
         $result = @()
         try { $result = @(Receive-Job -Job $script:appsJob -ErrorAction SilentlyContinue) } catch { }
@@ -2062,6 +2068,7 @@ function Refresh-Apps {
         }
         $result
     } -ArgumentList @($script:wsl, $script:wslDistro, $script:adbSerial, $dexPath, $script:dataRoot)
+    $script:appsJobStart = [DateTime]::UtcNow
     $appsRefreshTimer.Start()
 }
 
@@ -4623,11 +4630,10 @@ $startupProbeTimer.Add_Tick({
                 Set-Status 'Android остановлен' '#F5A623'
                 $backendBtn.Visibility = 'Collapsed'
             }
-            if ($script:sessionRunning) {
-                Invoke-Safe 'startup.apps' { Refresh-Apps }
-            } else {
-                Invoke-Safe 'startup.session' { Start-Session }
-            }
+            # Always try to refresh the list; even a frozen Android should
+            # leave the cached list visible.
+            Invoke-Safe 'startup.apps' { Refresh-Apps }
+            if (-not $script:sessionRunning) { Invoke-Safe 'startup.session' { Start-Session } }
         }
     }
 })
@@ -4662,6 +4668,15 @@ function Start-StartupProbe {
 }
 
 $window.Add_Loaded({
+    # Never start with an empty list: show the last known apps immediately,
+    # then replace them when the background probe finishes.
+    Invoke-Safe 'loaded.cache' {
+        if (@($script:apps).Count -eq 0) {
+            $script:apps = @(Get-CachedLauncherApps)
+            Update-AppFilter
+            if (@($script:apps).Count -gt 0) { Set-Footer "Приложений: $($script:apps.Count) (кэш)" }
+        }
+    }
     Invoke-Safe 'loaded.keepalive' { Start-WslKeepAlive }
     Invoke-Safe 'loaded.restore' { Restore-OrphanedParkedWindows }
     Start-StartupProbe
