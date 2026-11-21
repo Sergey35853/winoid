@@ -30,7 +30,8 @@ foreach ($needle in @(
     '$dy = $dir * $mag * 150', 'parked late surface',
     '$script:hideCaption = $false', 'x:Name="NavInsetCheck"', 'fallbackNavInset', 'EdgeCrop',
     'sub-surface', 'letterbox', 'StretchFillCheck', 'GameModeBtn',
-    'script:appGeometry', 'NotifyIcon', 'DiagFilter', 'exec sleep 86400'
+    'script:appGeometry', 'NotifyIcon', 'DiagFilter', 'exec sleep 86400',
+    'x:Name="LangBtn"', 'script:translations', 'script:profilesPath', 'x:Name="ProfileBox"'
 )) {
     Assert-True ($text.Contains($needle)) "contains: $needle"
 }

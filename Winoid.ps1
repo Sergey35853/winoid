@@ -447,7 +447,7 @@ function Initialize-WinoidData {
 # Optional config: %LOCALAPPDATA%\Winoid\config.json
 # { "wslDistro": "Winoid", "adbSerial": "192.168.240.112:5555" }
 $script:dataRoot = Initialize-WinoidData
-$script:appVersion = '0.1.24'
+$script:appVersion = '0.1.25'
 $script:iconQueue = New-Object System.Collections.Queue
 $script:geometryPath = Join-Path $script:dataRoot 'geometry.json'
 $script:appGeometry = @{}
@@ -456,6 +456,8 @@ $script:captionHeightPx = 48
 $script:fallbackNavInset = 48
 $script:edgeCropPx = 3
 $script:stretchFill = $false
+$script:language = 'ru'
+$script:origText = @{}
 $script:adbTimeoutMs = 10000
 $script:sessionTimeoutMs = 15000
 $script:configDir = $script:dataRoot
@@ -471,6 +473,7 @@ if (Test-Path -LiteralPath $script:configPath) {
         if ($cfg.captionHeightPx) { $script:captionHeightPx = [int]$cfg.captionHeightPx }
         if ($null -ne $cfg -and ($cfg.PSObject.Properties.Name -contains 'fallbackNavInset')) { $script:fallbackNavInset = [int]$cfg.fallbackNavInset }
         if ($null -ne $cfg -and ($cfg.PSObject.Properties.Name -contains 'stretchFill')) { $script:stretchFill = [bool]$cfg.stretchFill }
+        if ($cfg.language) { $script:language = [string]$cfg.language }
         if ($cfg.armTranslator) { $script:armTranslator = [string]$cfg.armTranslator }
         if ($null -ne $cfg -and ($cfg.PSObject.Properties.Name -contains 'armCompat')) {
             $script:armCompat = [bool]$cfg.armCompat
@@ -479,6 +482,38 @@ if (Test-Path -LiteralPath $script:configPath) {
 }
 if ($env:WINOID_WSL_DISTRO) { $script:wslDistro = $env:WINOID_WSL_DISTRO }
 if ($env:WINOID_ADB_SERIAL) { $script:adbSerial = $env:WINOID_ADB_SERIAL }
+
+# Android profiles: named sets of WSL distro / adb serial.
+$script:profilesPath = Join-Path $script:dataRoot 'profiles.json'
+$script:profiles = @{}
+$script:activeProfile = 'default'
+if (Test-Path -LiteralPath $script:profilesPath) {
+    try {
+        $pf = Get-Content -LiteralPath $script:profilesPath -Raw -Encoding utf8 | ConvertFrom-Json
+        if ($pf.active) { $script:activeProfile = [string]$pf.active }
+        if ($null -ne $pf.profiles) {
+            foreach ($prop in $pf.profiles.PSObject.Properties) { $script:profiles[[string]$prop.Name] = $prop.Value }
+        }
+    } catch { }
+}
+if (-not $script:profiles.ContainsKey($script:activeProfile)) { $script:profiles[$script:activeProfile] = [pscustomobject]@{ wslDistro = $script:wslDistro; adbSerial = $script:adbSerial } }
+function Save-Profiles {
+    try {
+        $map = [pscustomobject]@{}
+        foreach ($k in @($script:profiles.Keys)) {
+            $v = $script:profiles[$k]
+            $map | Add-Member -NotePropertyName ([string]$k) -NotePropertyValue ([pscustomobject]@{ wslDistro = [string]$v.wslDistro; adbSerial = [string]$v.adbSerial }) -Force
+        }
+        ([pscustomobject]@{ active = $script:activeProfile; profiles = $map }) |
+            ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $script:profilesPath -Encoding utf8NoBOM
+    } catch { Write-WinoidLog ("ERROR save profiles: " + $_.Exception.ToString()) }
+}
+if (-not $env:WINOID_WSL_DISTRO -and $script:profiles[$script:activeProfile].wslDistro) {
+    $script:wslDistro = [string]$script:profiles[$script:activeProfile].wslDistro
+}
+if (-not $env:WINOID_ADB_SERIAL -and $script:profiles[$script:activeProfile].adbSerial) {
+    $script:adbSerial = [string]$script:profiles[$script:activeProfile].adbSerial
+}
 
 # Keep the user's existing config keys; only add or update ARM settings.
 # The translator is remembered too, so the manager does not have to inspect
@@ -521,6 +556,11 @@ function Save-ArmCompatSetting {
             $cfg.stretchFill = [bool]$script:stretchFill
         } else {
             $cfg | Add-Member -NotePropertyName stretchFill -NotePropertyValue ([bool]$script:stretchFill)
+        }
+        if ($cfg.PSObject.Properties.Name -contains 'language') {
+            $cfg.language = [string]$script:language
+        } else {
+            $cfg | Add-Member -NotePropertyName language -NotePropertyValue ([string]$script:language)
         }
         $cfg | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $script:configPath -Encoding utf8NoBOM
     } catch {
@@ -574,6 +614,99 @@ function Save-AppModes {
         ([pscustomobject]@{ remember = [bool]$script:rememberMode; modes = $map }) |
             ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:modesPath -Encoding utf8NoBOM
     } catch { Write-WinoidLog ("ERROR save modes: " + $_.Exception.ToString()) }
+}
+
+# Static UI translation. Dynamic status strings stay in the language of the
+# caller; this covers window controls, buttons and labels.
+$script:translations = @{
+    'Winoid' = 'Winoid'
+    'Android-приложения в отдельных окнах Windows' = 'Android apps in separate Windows'
+    'Проверка…' = 'Checking…'
+    'Обновить' = 'Refresh'
+    'Запустить в отдельном окне' = 'Launch in separate window'
+    'Ярлык на рабочем столе' = 'Desktop shortcut'
+    'Открыть диск Android' = 'Open Android drive'
+    'Мой компьютер' = 'My Computer'
+    'Удалить приложение (APK)' = 'Remove app (APK)'
+    'Удалить APK-файл…' = 'Delete APK file…'
+    'Диагностика и лог' = 'Diagnostics and log'
+    'Проверить обновления' = 'Check for updates'
+    'Экспорт настроек' = 'Export settings'
+    'Импорт настроек' = 'Import settings'
+    'Перезапустить Android' = 'Restart Android'
+    'Настройки Android' = 'Android settings'
+    'Установить APK…' = 'Install APK…'
+    'Настроить Android' = 'Set up Android'
+    'Размер нового окна' = 'New window size'
+    'Как есть (на весь экран)' = 'As is (full screen)'
+    '1280 × 800' = '1280 × 800'
+    '1600 × 900' = '1600 × 900'
+    '1920 × 1080' = '1920 × 1080'
+    'Телефон — вертикально (720 × 1280)' = 'Phone — portrait (720 × 1280)'
+    'Планшет — горизонтально (1280 × 800)' = 'Tablet — landscape (1280 × 800)'
+    'Скрывать индикатор после появления окна' = 'Hide loader when window appears'
+    'Запоминать режим для каждого приложения' = 'Remember mode per app'
+    'Обрезать заголовок Android (обычно не нужно)' = 'Crop Android caption (usually off)'
+    'Обрезать нижнюю полосу Android' = 'Crop Android bottom strip'
+    'Растягивать картинку по окну (без полей)' = 'Stretch image to window (no bars)'
+    'Режим совместимости ARM' = 'ARM compatibility mode'
+    'Помогает играм, которые зависают в ARM-трансляторе libndk. Медленнее, но надёжнее.' = 'Helps games that hang in the libndk ARM translator. Slower but safer.'
+    'Android-навигация' = 'Android navigation'
+    'Игра' = 'Game'
+    'Телефон' = 'Phone'
+    'Планшет' = 'Tablet'
+    '◀  Назад' = '◀  Back'
+    '●  Домой' = '●  Home'
+    '■  Недавние' = '■  Recents'
+    'Нажмите на окно — ввод пойдёт в Android' = 'Click the window to send input to Android'
+    'Приложение запускается…' = 'Starting app…'
+    'Запуск…' = 'Starting…'
+    'Готово' = 'Ready'
+    'Язык: RU' = 'Language: EN'
+    'Язык: EN' = 'Language: RU'
+    'Winoid — диагностика' = 'Winoid — diagnostics'
+    'Фильтр лога:' = 'Log filter:'
+    'Открыть лог' = 'Open log'
+    'Закрыть' = 'Close'
+}
+
+function Translate-Text([string]$text) {
+    if ($script:language -ne 'en') { return $text }
+    if ($script:translations.ContainsKey($text)) { return [string]$script:translations[$text] }
+    return $text
+}
+
+function Register-TextControl($control, [string]$property) {
+    try {
+        $value = $control.$property
+        if ($value -is [string] -and -not $script:origText.ContainsKey($control)) {
+            $script:origText[$control] = @{ Prop = $property; Value = $value }
+        }
+    } catch { }
+}
+
+function Register-WindowText($root) {
+    if ($null -eq $root) { return }
+    $q = New-Object System.Collections.Queue
+    $q.Enqueue($root)
+    while ($q.Count -gt 0) {
+        $el = $q.Dequeue()
+        if ($null -eq $el) { continue }
+        if ($el -is [System.Windows.Controls.TextBlock]) { Register-TextControl $el 'Text' }
+        elseif ($el -is [System.Windows.Controls.Button] -or $el -is [System.Windows.Controls.CheckBox]) { Register-TextControl $el 'Content' }
+        elseif ($el -is [System.Windows.Window]) { Register-TextControl $el 'Title' }
+        $n = 0
+        try { $n = [System.Windows.Media.VisualTreeHelper]::GetChildrenCount($el) } catch { }
+        for ($i = 0; $i -lt $n; $i++) {
+            try { $q.Enqueue([System.Windows.Media.VisualTreeHelper]::GetChild($el, $i)) } catch { }
+        }
+    }
+}
+
+function Apply-Language {
+    foreach ($entry in $script:origText.GetEnumerator()) {
+        try { $entry.Key.($entry.Value.Prop) = (Translate-Text ([string]$entry.Value.Value)) } catch { }
+    }
 }
 
 $mainXaml = @'
@@ -837,6 +970,10 @@ $mainXaml = @'
         <Button x:Name="UpdateBtn" Content="Проверить обновления"/>
         <Button x:Name="ExportCfgBtn" Content="Экспорт настроек"/>
         <Button x:Name="ImportCfgBtn" Content="Импорт настроек"/>
+        <Button x:Name="LangBtn" Content="Язык: RU"/>
+        <TextBlock Text="Профиль Android" FontSize="12" Foreground="#8D929C" Margin="2,4,0,6"/>
+        <ComboBox x:Name="ProfileBox" Margin="0,0,0,6"/>
+        <Button x:Name="NewProfileBtn" Content="Новый профиль…"/>
         <Button x:Name="FullUiBtn" Content="Перезапустить Android"/>
         <Button x:Name="SettingsBtn" Content="Настройки Android"/>
         <Button x:Name="InstallBtn" Content="Установить APK…"/>
@@ -1067,6 +1204,9 @@ $deleteApkBtn  = $window.FindName('DeleteApkBtn')
 $updateBtn     = $window.FindName('UpdateBtn')
 $exportCfgBtn  = $window.FindName('ExportCfgBtn')
 $importCfgBtn  = $window.FindName('ImportCfgBtn')
+$langBtn       = $window.FindName('LangBtn')
+$profileBox    = $window.FindName('ProfileBox')
+$newProfileBtn = $window.FindName('NewProfileBtn')
 $diagText      = $diagWindow.FindName('DiagText')
 $diagFilter    = $diagWindow.FindName('DiagFilter')
 $diagRefreshBtn = $diagWindow.FindName('DiagRefreshBtn')
@@ -1097,6 +1237,16 @@ $loaderBar     = $loader.FindName('LoaderBar')
 $loaderIcon    = $loader.FindName('LoaderIcon')
 $showWindowBtn = $loader.FindName('ShowWindowBtn')
 $hideLoaderBtn = $loader.FindName('HideLoaderBtn')
+
+Register-WindowText $window
+Register-WindowText $loader
+Register-WindowText $diagWindow
+if ($script:language -eq 'en') { Apply-Language }
+$langBtn.Content = $(if ($script:language -eq 'en') { 'EN / RU' } else { 'RU / EN' })
+$script:profileLoading = $true
+foreach ($pname in @($script:profiles.Keys | Sort-Object)) { [void]$profileBox.Items.Add($pname) }
+$profileBox.SelectedItem = $script:activeProfile
+$script:profileLoading = $false
 
 function Set-Status([string]$text, [string]$color) {
     $statusText.Text = $text
@@ -2726,6 +2876,8 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
     $w.HintUntil = [DateTime]::UtcNow.AddSeconds(8)
 
     $win = [System.Windows.Markup.XamlReader]::Parse($script:wrapperXaml)
+    Register-WindowText $win
+    if ($script:language -eq 'en') { Apply-Language }
     $win.Title = "$displayName — Winoid"
     if ($null -ne $script:appIcon) { $win.Icon = $script:appIcon }
     $image = $win.FindName('View')
@@ -4017,6 +4169,39 @@ $deleteApkBtn.Add_Click({ Invoke-Safe 'deleteApkBtn' {
             } catch { Set-Footer "Не удалось удалить файл: $($_.Exception.Message)" }
         }
     }
+} })
+$profileBox.Add_SelectionChanged({
+    Invoke-Safe 'profileChange' {
+        if ($script:profileLoading) { return }
+        $name = [string]$profileBox.SelectedItem
+        if ([string]::IsNullOrWhiteSpace($name) -or $name -eq $script:activeProfile) { return }
+        $script:profiles[$script:activeProfile] = [pscustomobject]@{ wslDistro = $script:wslDistro; adbSerial = $script:adbSerial }
+        $script:activeProfile = $name
+        $p = $script:profiles[$name]
+        if ($p.wslDistro) { $script:wslDistro = [string]$p.wslDistro }
+        if ($p.adbSerial) { $script:adbSerial = [string]$p.adbSerial }
+        Save-Profiles
+        Set-Footer "Профиль «$name» выбран. Перезапустите Winoid."
+    }
+})
+$newProfileBtn.Add_Click({
+    Invoke-Safe 'newProfile' {
+        Add-Type -AssemblyName Microsoft.VisualBasic
+        $name = [string][Microsoft.VisualBasic.Interaction]::InputBox('Имя нового профиля:', 'Winoid', 'profile2')
+        if ([string]::IsNullOrWhiteSpace($name)) { return }
+        $script:profiles[$name] = [pscustomobject]@{ wslDistro = $script:wslDistro; adbSerial = $script:adbSerial }
+        Save-Profiles
+        [void]$profileBox.Items.Add($name)
+        $profileBox.SelectedItem = $name
+        Set-Footer "Профиль «$name» создан."
+    }
+})
+$langBtn.Add_Click({ Invoke-Safe 'langBtn' {
+    $script:language = $(if ($script:language -eq 'en') { 'ru' } else { 'en' })
+    Save-ArmCompatSetting
+    Apply-Language
+    $langBtn.Content = $(if ($script:language -eq 'en') { 'EN / RU' } else { 'RU / EN' })
+    Set-Footer $(if ($script:language -eq 'en') { 'Language: English' } else { 'Язык: русский' })
 } })
 $exportCfgBtn.Add_Click({ Invoke-Safe 'exportCfg' {
     $dlg = [Microsoft.Win32.SaveFileDialog]::new()
