@@ -29,7 +29,8 @@ foreach ($needle in @(
     'x:Name="HideCaptionCheck"', 'CaptionInset', 'function Restore-OrphanedParkedWindows',
     '$dy = $dir * $mag * 150', 'parked late surface',
     '$script:hideCaption = $false', 'x:Name="NavInsetCheck"', 'fallbackNavInset', 'EdgeCrop',
-    'sub-surface', 'letterbox'
+    'sub-surface', 'letterbox', 'StretchFillCheck', 'GameModeBtn',
+    'script:appGeometry', 'NotifyIcon', 'DiagFilter', 'exec sleep 86400'
 )) {
     Assert-True ($text.Contains($needle)) "contains: $needle"
 }

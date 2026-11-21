@@ -447,12 +447,15 @@ function Initialize-WinoidData {
 # Optional config: %LOCALAPPDATA%\Winoid\config.json
 # { "wslDistro": "Winoid", "adbSerial": "192.168.240.112:5555" }
 $script:dataRoot = Initialize-WinoidData
-$script:appVersion = '0.1.23'
+$script:appVersion = '0.1.24'
 $script:iconQueue = New-Object System.Collections.Queue
+$script:geometryPath = Join-Path $script:dataRoot 'geometry.json'
+$script:appGeometry = @{}
 $script:hideCaption = $false
 $script:captionHeightPx = 48
 $script:fallbackNavInset = 48
 $script:edgeCropPx = 3
+$script:stretchFill = $false
 $script:adbTimeoutMs = 10000
 $script:sessionTimeoutMs = 15000
 $script:configDir = $script:dataRoot
@@ -467,6 +470,7 @@ if (Test-Path -LiteralPath $script:configPath) {
         if ($null -ne $cfg -and ($cfg.PSObject.Properties.Name -contains 'hideCaption')) { $script:hideCaption = [bool]$cfg.hideCaption }
         if ($cfg.captionHeightPx) { $script:captionHeightPx = [int]$cfg.captionHeightPx }
         if ($null -ne $cfg -and ($cfg.PSObject.Properties.Name -contains 'fallbackNavInset')) { $script:fallbackNavInset = [int]$cfg.fallbackNavInset }
+        if ($null -ne $cfg -and ($cfg.PSObject.Properties.Name -contains 'stretchFill')) { $script:stretchFill = [bool]$cfg.stretchFill }
         if ($cfg.armTranslator) { $script:armTranslator = [string]$cfg.armTranslator }
         if ($null -ne $cfg -and ($cfg.PSObject.Properties.Name -contains 'armCompat')) {
             $script:armCompat = [bool]$cfg.armCompat
@@ -513,10 +517,33 @@ function Save-ArmCompatSetting {
         } else {
             $cfg | Add-Member -NotePropertyName fallbackNavInset -NotePropertyValue ([int]$script:fallbackNavInset)
         }
+        if ($cfg.PSObject.Properties.Name -contains 'stretchFill') {
+            $cfg.stretchFill = [bool]$script:stretchFill
+        } else {
+            $cfg | Add-Member -NotePropertyName stretchFill -NotePropertyValue ([bool]$script:stretchFill)
+        }
         $cfg | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $script:configPath -Encoding utf8NoBOM
     } catch {
         Write-WinoidLog ("ERROR save config: " + $_.Exception.ToString())
     }
+}
+
+if (Test-Path -LiteralPath $script:geometryPath) {
+    try {
+        $g = Get-Content -LiteralPath $script:geometryPath -Raw -Encoding utf8 | ConvertFrom-Json
+        foreach ($prop in $g.PSObject.Properties) { $script:appGeometry[[string]$prop.Name] = $prop.Value }
+    } catch { }
+}
+
+function Save-AppGeometry {
+    try {
+        $map = [pscustomobject]@{}
+        foreach ($key in @($script:appGeometry.Keys)) {
+            $v = $script:appGeometry[$key]
+            $map | Add-Member -NotePropertyName ([string]$key) -NotePropertyValue ([pscustomobject]@{ W = [int]$v.W; H = [int]$v.H }) -Force
+        }
+        $map | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $script:geometryPath -Encoding utf8NoBOM
+    } catch { Write-WinoidLog ("ERROR save geometry: " + $_.Exception.ToString()) }
 }
 
 function Read-JsonFile([string]$path) {
@@ -828,6 +855,7 @@ $mainXaml = @'
         <CheckBox x:Name="AutoHideCheck" Content="Скрывать индикатор после появления окна" Foreground="#C9CDD4" IsChecked="True" Margin="2,0,0,14"/>
         <CheckBox x:Name="HideCaptionCheck" Content="Обрезать заголовок Android (обычно не нужно)" Foreground="#C9CDD4" IsChecked="False" Margin="2,0,0,4"/>
         <CheckBox x:Name="NavInsetCheck" Content="Обрезать нижнюю полосу Android" Foreground="#C9CDD4" IsChecked="True" Margin="2,0,0,4"/>
+        <CheckBox x:Name="StretchFillCheck" Content="Растягивать картинку по окну (без полей)" Foreground="#C9CDD4" IsChecked="False" Margin="2,0,0,4"/>
         <CheckBox x:Name="ArmCompatCheck" Content="Режим совместимости ARM" Foreground="#C9CDD4" Margin="2,0,0,4"/>
         <TextBlock x:Name="ArmCompatHint" Text="Помогает играм, которые зависают в ARM-трансляторе libndk. Медленнее, но надёжнее." TextWrapping="Wrap" FontSize="11" Foreground="#8D929C" Margin="24,0,0,14"/>
         <TextBlock x:Name="HintText" TextWrapping="Wrap" FontSize="12" Foreground="#A9AEBA"
@@ -894,6 +922,10 @@ $diagXaml = @'
     </Style>
   </Window.Resources>
   <DockPanel Margin="16">
+    <StackPanel DockPanel.Dock="Top" Orientation="Horizontal" Margin="0,0,0,10">
+      <TextBlock Text="Фильтр лога:" VerticalAlignment="Center" Margin="0,0,8,0"/>
+      <TextBox x:Name="DiagFilter" Width="420"/>
+    </StackPanel>
     <StackPanel DockPanel.Dock="Bottom" Orientation="Horizontal" HorizontalAlignment="Right" Margin="0,12,0,0">
       <Button x:Name="DiagRefreshBtn" Content="Обновить" Width="110"/>
       <Button x:Name="DiagOpenLogBtn" Content="Открыть лог" Width="120"/>
@@ -947,7 +979,7 @@ $script:wrapperXaml = @'
     </Style>
   </Window.Resources>
   <DockPanel LastChildFill="True">
-    <Border DockPanel.Dock="Bottom" Height="44" Background="#15171C"
+    <Border x:Name="NavPanel" DockPanel.Dock="Bottom" Height="44" Background="#15171C"
             BorderBrush="#2A2C33" BorderThickness="0,1,0,0">
       <Grid Margin="10,0">
         <Grid.ColumnDefinitions>
@@ -955,6 +987,7 @@ $script:wrapperXaml = @'
           <ColumnDefinition Width="*"/>
         </Grid.ColumnDefinitions>
         <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
+          <Button x:Name="GameModeBtn" Content="Игра" FontSize="11" Padding="8,5" ToolTip="Скрыть панель и растянуть картинку"/>
           <Button x:Name="PhoneModeBtn" Content="Телефон" FontSize="11" Padding="8,5" ToolTip="Вертикальный режим 720 × 1280"/>
           <Button x:Name="TabletModeBtn" Content="Планшет" FontSize="11" Padding="8,5" ToolTip="Горизонтальный режим 1280 × 800"/>
           <Button x:Name="BackBtn" Content="◀  Назад" ToolTip="Назад в Android (Esc, Backspace или Alt+←)"/>
@@ -1023,6 +1056,8 @@ $hideCaptionCheck = $window.FindName('HideCaptionCheck')
 $hideCaptionCheck.IsChecked = [bool]$script:hideCaption
 $navInsetCheck = $window.FindName('NavInsetCheck')
 $navInsetCheck.IsChecked = ([int]$script:fallbackNavInset -gt 0)
+$stretchFillCheck = $window.FindName('StretchFillCheck')
+$stretchFillCheck.IsChecked = [bool]$script:stretchFill
 $armCompatCheck.IsChecked = [bool]$script:armCompat
 $armCompatHint = $window.FindName('ArmCompatHint')
 $footerText    = $window.FindName('FooterText')
@@ -1033,9 +1068,27 @@ $updateBtn     = $window.FindName('UpdateBtn')
 $exportCfgBtn  = $window.FindName('ExportCfgBtn')
 $importCfgBtn  = $window.FindName('ImportCfgBtn')
 $diagText      = $diagWindow.FindName('DiagText')
+$diagFilter    = $diagWindow.FindName('DiagFilter')
 $diagRefreshBtn = $diagWindow.FindName('DiagRefreshBtn')
 $diagOpenLogBtn = $diagWindow.FindName('DiagOpenLogBtn')
 $diagCloseBtn  = $diagWindow.FindName('DiagCloseBtn')
+
+# Tray icon with quick access even when the manager window is closed.
+$script:tray = $null
+try {
+    Add-Type -AssemblyName System.Windows.Forms
+    Add-Type -AssemblyName System.Drawing
+    $icoFile = Join-Path $PSScriptRoot 'assets\android.ico'
+    $script:tray = New-Object System.Windows.Forms.NotifyIcon
+    if (Test-Path -LiteralPath $icoFile) { $script:tray.Icon = [System.Drawing.Icon]::new($icoFile) }
+    $script:tray.Text = 'Winoid'
+    $menu = New-Object System.Windows.Forms.ContextMenuStrip
+    [void]$menu.Items.Add('Показать Winoid', $null, { param($s,$e) $window.Show(); $window.Activate() })
+    [void]$menu.Items.Add('Диагностика', $null, { param($s,$e) Show-Diagnostics })
+    [void]$menu.Items.Add('Выход', $null, { param($s,$e) $window.Close() })
+    $script:tray.ContextMenuStrip = $menu
+    $script:tray.Visible = $true
+} catch { }
 
 $loaderTitle   = $loader.FindName('LoaderTitle')
 $loaderSub     = $loader.FindName('LoaderSub')
@@ -1068,7 +1121,12 @@ function Show-Diagnostics {
         [void]$lines.Add("Icons: $(@(Get-ChildItem -LiteralPath (Join-Path $script:dataRoot 'icons') -ErrorAction SilentlyContinue).Count)")
         [void]$lines.Add('=== Log (last 40) ===')
         $log = Join-Path $script:dataRoot 'winoid.log'
-        if (Test-Path -LiteralPath $log) { [void]$lines.AddRange(@(Get-Content -LiteralPath $log -Tail 40)) }
+        if (Test-Path -LiteralPath $log) {
+            $tail = @(Get-Content -LiteralPath $log -Tail 300)
+            $needle = $diagFilter.Text.Trim()
+            if ($needle) { $tail = @($tail | Where-Object { $_ -match [regex]::Escape($needle) }) }
+            [void]$lines.AddRange(@($tail | Select-Object -Last 40))
+        }
         $diagText.Text = ($lines -join "`r`n")
         if (-not $diagWindow.IsVisible) { $diagWindow.Show() }
         $diagWindow.Activate()
@@ -1485,6 +1543,11 @@ function Start-WslDetached {
 # A sleeping client keeps the Android session alive while the manager is open.
 function Start-WslKeepAlive {
     if ($script:wslKeepAlive -and -not $script:wslKeepAlive.HasExited) { return }
+    # A manager restart leaves the previous keepalive running; without this
+    # cleanup dozens of sleeping wsl.exe clients accumulate.
+    $stale = @(Get-CimInstance Win32_Process -Filter "Name='wsl.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { $_.CommandLine -like '*exec sleep 86400*' -and $_.ProcessId -ne $PID })
+    foreach ($p in $stale) { Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue }
     $psi = [System.Diagnostics.ProcessStartInfo]::new()
     $psi.FileName = $script:wsl
     foreach ($a in ((Get-WslBase) + @('--', 'bash', '-lc', 'exec sleep 86400'))) { [void]$psi.ArgumentList.Add($a) }
@@ -1513,13 +1576,16 @@ function Get-WaydroidContainerStatus {
 
 # Wake a suspended Android runtime before any operation that needs adb.
 # show-full-ui opens the launcher surface, which the manager already parks.
-function Ensure-WaydroidAwake {
+function Ensure-WaydroidAwake([string]$package) {
     $state = Get-WaydroidContainerStatus
     if ($state -eq 'RUNNING') { return $true }
     if ($state -eq 'FROZEN') {
-        Write-WinoidLog 'waydroid frozen: waking container'
+        Write-WinoidLog 'waydroid frozen: waking container quietly'
+        # Launching the target app wakes the runtime without opening the
+        # Android launcher on the desktop (unlike show-full-ui).
+        $wakeCmd = if (-not [string]::IsNullOrWhiteSpace($package)) { "waydroid app launch $package" } else { 'waydroid show-full-ui' }
         try {
-            $null = Invoke-Wsl ((Get-WslBase) + @('--', 'bash', '-lc', 'nohup waydroid show-full-ui >/dev/null 2>&1 &')) 10000
+            $null = Invoke-Wsl ((Get-WslBase) + @('--', 'bash', '-lc', $wakeCmd)) 12000
         } catch { }
         for ($i = 0; $i -lt 14; $i++) {
             Start-Sleep -Milliseconds 700
@@ -1700,8 +1766,6 @@ function Refresh-Apps {
         return
     }
     Set-Footer 'Чтение списка приложений…'
-    # A suspended container cannot answer the DEX helper or adb.
-    Ensure-WaydroidAwake | Out-Null
 
     $script:apps = @(Get-LauncherApps)
     if ($script:apps.Count -eq 0) {
@@ -1964,17 +2028,20 @@ function Find-WrapperByPackage([string]$package) {
 function Map-WrapperPoint($w, $pos) {
     $cw = $w.Image.ActualWidth; $ch = $w.Image.ActualHeight
     if ($cw -le 0 -or $ch -le 0) { return $null }
-    $scale = [math]::Min($cw / $w.SrcW, $ch / $w.SrcH)
-    if ($scale -le 0) { return $null }
-    $ox = ($cw - $w.SrcW * $scale) / 2
-    $oy = ($ch - $w.SrcH * $scale) / 2
-    $fx = ($pos.X - $ox) / $scale
-    $fy = ($pos.Y - $oy) / $scale
-    # Taps in the black letterbox around the image are mapped to the nearest
-    # content edge instead of being ignored, so the top/bottom strip of the
-    # wrapper still controls the app.
-    $fx = [Math]::Max(0, [Math]::Min([double]($w.SrcW - 1), $fx))
-    $fy = [Math]::Max(0, [Math]::Min([double]($w.SrcH - 1), $fy))
+    if ([bool]$script:stretchFill) {
+        $fx = $pos.X / ([double]$cw / $w.SrcW)
+        $fy = $pos.Y / ([double]$ch / $w.SrcH)
+    } else {
+        $scale = [math]::Min($cw / $w.SrcW, $ch / $w.SrcH)
+        if ($scale -le 0) { return $null }
+        $ox = ($cw - $w.SrcW * $scale) / 2
+        $oy = ($ch - $w.SrcH * $scale) / 2
+        $fx = ($pos.X - $ox) / $scale
+        $fy = ($pos.Y - $oy) / $scale
+        # Taps in the black letterbox map to the nearest content edge.
+        $fx = [Math]::Max(0, [Math]::Min([double]($w.SrcW - 1), $fx))
+        $fy = [Math]::Max(0, [Math]::Min([double]($w.SrcH - 1), $fy))
+    }
     $sx = [int][math]::Floor($fx)
     $sy = [int][math]::Floor($fy)
     foreach ($pane in @($w.Panes)) {
@@ -2653,6 +2720,7 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
     $w.WheelAcc = 0
     $w.WheelLogSign = 0
     $w.ParkSweepAt = $null
+    $w.GameMode = $false
     # The onboarding hint covers game UI until the first tap; hide it by
     # itself after a few seconds so screenshots and idle windows stay clean.
     $w.HintUntil = [DateTime]::UtcNow.AddSeconds(8)
@@ -2669,6 +2737,8 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
     $homeBtn = $win.FindName('HomeBtn')
     $recentsBtn = $win.FindName('RecentsBtn')
     $navLabel = $win.FindName('NavLabel')
+    $navPanel = $win.FindName('NavPanel')
+    $gameModeBtn = $win.FindName('GameModeBtn')
     $phoneModeBtn = $win.FindName('PhoneModeBtn')
     $tabletModeBtn = $win.FindName('TabletModeBtn')
 
@@ -2677,6 +2747,7 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
 
     $w.Window = $win
     $w.Image = $image
+    $image.Stretch = $(if ($script:stretchFill) { 'Fill' } else { 'Uniform' })
     $w.Hint = $hint
     $w.Loading = $loading
     $w.LoadingText = $loadingText
@@ -2685,6 +2756,14 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
 
     if ($null -ne $loadingIcon) { $loadingIcon.Source = $script:appIcon }
 
+    $gameModeBtn.Add_Click({ Invoke-Safe 'gameMode' {
+        $w.GameMode = -not [bool]$w.GameMode
+        try {
+            $navPanel.Visibility = $(if ($w.GameMode) { 'Collapsed' } else { 'Visible' })
+            $image.Stretch = $(if ($w.GameMode) { 'Fill' } else { $(if ($script:stretchFill) { 'Fill' } else { 'Uniform' }) })
+        } catch { }
+        Set-Footer $(if ($w.GameMode) { 'Игровой режим включён.' } else { 'Игровой режим выключен.' })
+    } })
     $phoneModeBtn.Add_Click({ Invoke-Safe 'phoneMode' { Set-LiveDisplayMode $w 'phone' } })
     $tabletModeBtn.Add_Click({ Invoke-Safe 'tabletMode' { Set-LiveDisplayMode $w 'tablet' } })
 
@@ -2792,6 +2871,17 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
             Send-Android "input swipe $($p[0]) $($p[1]) $($p[0]) $($p[1] + $dy) 180"
         } catch { }
     })
+    $image.Add_MouseRightButtonDown({
+        param($sender, $e)
+        $w = $script:wrapByImage[$sender]
+        if ($null -eq $w -or $w.Closed) { return }
+        try {
+            $p = Map-WrapperPoint $w $e.GetPosition($sender)
+            if ($null -eq $p) { return }
+            # A stationary long swipe is how Android sees a long press.
+            Send-Android "input swipe $($p[0]) $($p[1]) $($p[0]) $($p[1]) 650"
+        } catch { }
+    })
     $backBtn.Add_Click({
         param($sender, $e)
         try {
@@ -2853,6 +2943,12 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
         Invoke-Safe 'wrapper.closing' {
             $w = $script:wrapByWindow[$sender]
             if ($null -eq $w -or $w.Closed) { return }
+            try {
+                if ($sender.WindowState -ne 'Maximized' -and $sender.ActualWidth -gt 100) {
+                    $script:appGeometry[[string]$w.Package] = [pscustomobject]@{ W = [int]$sender.ActualWidth; H = [int]$sender.ActualHeight }
+                    Save-AppGeometry
+                }
+            } catch { }
             Remove-Wrapper $w $true
         }
     })
@@ -2863,6 +2959,10 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
 
     $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
     if ($null -ne $size -and [int]$size.Width -gt 0) { $cw = [int]$size.Width; $ch = [int]$size.Height }
+    elseif ($script:appGeometry.ContainsKey([string]$app.Package)) {
+        $g = $script:appGeometry[[string]$app.Package]
+        $cw = [int]$g.W; $ch = [int]$g.H
+    }
     elseif ($app.Package -eq 'com.android.settings') {
         # Settings is a two-pane 2560x1392 desktop. At full size it would be
         # wider than most monitors, so show it at a comfortable default width.
@@ -2926,7 +3026,7 @@ $script:bounceTimer.Add_Tick({
 })
 
 $script:frameTimer = [System.Windows.Threading.DispatcherTimer]::new()
-$script:frameTimer.Interval = [TimeSpan]::FromMilliseconds(40)
+$script:frameTimer.Interval = [TimeSpan]::FromMilliseconds(50)
 $script:frameTimer.Add_Tick({
     try {
         $beatNow = [DateTime]::UtcNow
@@ -2960,7 +3060,10 @@ $script:frameTimer.Add_Tick({
                 $w.Hint.Visibility = 'Collapsed'
                 $w.HintUntil = $null
             }
-            $capture = ($w.Window.IsVisible -and $w.Window.WindowState -ne 'Minimized')
+            # Only grab frames for the active wrapper at full rate; inactive
+            # ones refresh occasionally so switching back is not stale.
+            $capture = ($w.Window.IsVisible -and $w.Window.WindowState -ne 'Minimized' -and
+                        ($w.Window.IsActive -or (($w.Frames % 20) -eq 0)))
             $lumaSum = 0.0
             $lumaRows = 0
             foreach ($pane in @($w.Panes)) {
@@ -3241,7 +3344,7 @@ function Start-AppLaunch($app) {
 
     # Wake a frozen runtime first, otherwise wm size/density and the launch
     # itself would silently hang.
-    Ensure-WaydroidAwake | Out-Null
+    Ensure-WaydroidAwake ([string]$app.Package) | Out-Null
 
     # Apply the display mode picked in the manager before the app starts:
     # phone = portrait + phone density, tablet = landscape + tablet density.
@@ -3273,7 +3376,18 @@ function Start-AppLaunch($app) {
     $loaderTitle.Text = "Запуск: $displayName"
     $loaderSub.Text = 'Открываю приложение в отдельном окне.'
     $loaderElapsed.Text = '0 сек'
-    if ($null -ne $loaderIcon) { try { $loaderIcon.Source = Get-AppIconPath $app } catch { } }
+    if ($null -ne $loaderIcon) {
+        # Never block the launch on ADB here: use the cached icon or the
+        # bundled one. Missing icons are filled in by the background queue.
+        try {
+            $ico = Join-Path (Join-Path $script:dataRoot 'icons') ($app.Package + '.ico')
+            if (Test-Path -LiteralPath $ico) {
+                $loaderIcon.Source = [System.Windows.Media.Imaging.BitmapFrame]::Create([Uri]::new($ico))
+            } elseif ($null -ne $script:appIcon) {
+                $loaderIcon.Source = $script:appIcon
+            }
+        } catch { }
+    }
     $loader.Show()
     $loaderBar.IsIndeterminate = $true
     $launchTimer.Start()
@@ -4041,6 +4155,16 @@ $backendBtn.Add_Click({
 })
 $fullUiBtn.Add_Click({ Invoke-Safe 'restart' { Start-Session -Restart } })
 $settingsBtn.Add_Click({ Invoke-Safe 'settingsBtn' { Start-AndroidWindow 'com.android.settings' 'Настройки Android' } })
+$stretchFillCheck.Add_Checked({ Invoke-Safe 'stretchOn' {
+    $script:stretchFill = $true; Save-ArmCompatSetting
+    foreach ($wr in @($script:wrappers)) { try { $wr.Image.Stretch = 'Fill' } catch { } }
+    Set-Footer 'Картинка растягивается по окну.'
+} })
+$stretchFillCheck.Add_Unchecked({ Invoke-Safe 'stretchOff' {
+    $script:stretchFill = $false; Save-ArmCompatSetting
+    foreach ($wr in @($script:wrappers)) { try { $wr.Image.Stretch = 'Uniform' } catch { } }
+    Set-Footer 'Пропорции картинки сохранены.'
+} })
 $navInsetCheck.Add_Checked({ Invoke-Safe 'navInsetOn' {
     $script:fallbackNavInset = 48; Save-ArmCompatSetting
     Set-Footer 'Нижняя полоса Android будет обрезаться в новых окнах.'
@@ -4116,6 +4240,8 @@ $window.Add_Drop({
 })
 $window.Add_Closing({
     $script:exiting = $true
+    Write-WinoidLog 'manager closing (clean shutdown)'
+    try { if ($null -ne $script:tray) { $script:tray.Visible = $false; $script:tray.Dispose() } } catch { }
     try { [System.IO.File]::WriteAllText($script:shutdownPath, (Get-Date).ToString('o')) } catch { }
     Invoke-Safe 'closing.timers' {
         $launchTimer.Stop()
