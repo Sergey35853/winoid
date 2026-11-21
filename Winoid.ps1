@@ -484,7 +484,7 @@ function Initialize-WinoidData {
 # Optional config: %LOCALAPPDATA%\Winoid\config.json
 # { "wslDistro": "Winoid", "adbSerial": "192.168.240.112:5555" }
 $script:dataRoot = Initialize-WinoidData
-$script:appVersion = '0.1.34'
+$script:appVersion = '0.1.36'
 $script:iconQueue = New-Object System.Collections.Queue
 $script:geometryPath = Join-Path $script:dataRoot 'geometry.json'
 $script:appGeometry = @{}
@@ -2133,12 +2133,10 @@ function Set-LiveDisplayMode($w, [string]$mode) {
     }
     try {
         if ($mode -eq 'phone') {
-            Send-Android 'wm size 720x1280'
-            Send-Android 'wm density 320'
+            Set-AndroidDisplay '720x1280' '320'
             Set-Footer 'Режим: телефон (вертикально 720 × 1280).'
         } else {
-            Send-Android 'wm size 1280x800'
-            Send-Android 'wm density 160'
+            Set-AndroidDisplay '1280x800' '160'
             Set-Footer 'Режим: планшет (горизонтально 1280 × 800).'
         }
     } catch {
@@ -2229,6 +2227,18 @@ function Initialize-Adb {
     } else {
         $script:adbNextTry = (Get-Date).AddSeconds(60)
     }
+}
+
+function Set-AndroidDisplay([string]$sizeArg, [string]$densityArg) {
+    # Use a fresh adb client: the persistent shell can be stale after a
+    # Waydroid session restart and silently swallow commands.
+    try {
+        $null = Invoke-Wsl ((Get-WslBase) + @('--', 'adb', '-s', $script:adbSerial, 'shell', 'wm', 'size', $sizeArg)) 10000
+    } catch { Write-WinoidLog ("ERROR wm size: " + $_.Exception.Message) }
+    try {
+        $null = Invoke-Wsl ((Get-WslBase) + @('--', 'adb', '-s', $script:adbSerial, 'shell', 'wm', 'density', $densityArg)) 10000
+    } catch { Write-WinoidLog ("ERROR wm density: " + $_.Exception.Message) }
+    Write-WinoidLog "display set: size=$sizeArg density=$densityArg"
 }
 
 function Send-Android([string]$cmd) {
@@ -3652,13 +3662,17 @@ function Start-AppLaunch($app) {
     $sizeChoice = $script:launchState.Size
     if ($null -ne $sizeChoice) {
         if ($sizeChoice.Reset) {
-            try { Send-Android 'wm size reset' } catch { }
-            try { Send-Android 'wm density reset' } catch { }
-        } else {
-            try { Send-Android "wm size $($sizeChoice.Width)x$($sizeChoice.Height)" } catch { }
-            if ([int]$sizeChoice.Density -gt 0) {
-                try { Send-Android "wm density $($sizeChoice.Density)" } catch { }
+            # The game lays out its UI for the full 1920x1032 display but the
+            # WSLg window is only ~920x510. A lower density shrinks the UI so
+            # the right-hand buttons fit inside the captured surface.
+            if ([string]$app.Package -eq 'com.ihgames.im.android.google') {
+                Set-AndroidDisplay 'reset' '120'
+            } else {
+                Set-AndroidDisplay 'reset' 'reset'
             }
+        } else {
+            $density = $(if ([int]$sizeChoice.Density -gt 0) { [string]$sizeChoice.Density } else { 'reset' })
+            Set-AndroidDisplay "$($sizeChoice.Width)x$($sizeChoice.Height)" $density
         }
         Start-Sleep -Milliseconds 600
     }

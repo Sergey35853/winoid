@@ -25,6 +25,10 @@ namespace Winoid {
                 return;
             }
 
+            // Remember the original arguments for the very first start only.
+            // A watchdog restart must not silently relaunch the game again.
+            string[] firstArgs = args;
+            bool first = true;
             for (;;) {
                 try { if (File.Exists(quit)) File.Delete(quit); } catch { }
 
@@ -37,7 +41,7 @@ namespace Winoid {
                     psi.WindowStyle = ProcessWindowStyle.Hidden;
                     psi.Arguments =
                         "-NoProfile -Sta -ExecutionPolicy Bypass -WindowStyle Hidden -File " + Q(script);
-                    foreach (string a in args) psi.Arguments += " " + Q(a);
+                    foreach (string a in (first ? firstArgs : new string[0])) psi.Arguments += " " + Q(a);
                     proc = Process.Start(psi);
                 } catch (Exception ex) {
                     MessageBox.Show("Could not start PowerShell 7.\n" + ex.Message +
@@ -48,6 +52,7 @@ namespace Winoid {
 
                 proc.WaitForExit();
                 proc.Dispose();
+                first = false;
                 Thread.Sleep(2500);
 
                 bool clean = false;
