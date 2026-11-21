@@ -28,7 +28,7 @@ foreach ($needle in @(
     'function Restart-WaydroidSession', 'LaunchCmd = ', 'force-stop',
     'x:Name="HideCaptionCheck"', 'CaptionInset', 'function Restore-OrphanedParkedWindows',
     '$dy = $dir * $mag * 150', 'parked late surface',
-    '$script:hideCaption = $false'
+    '$script:hideCaption = $false', 'x:Name="NavInsetCheck"', 'fallbackNavInset'
 )) {
     Assert-True ($text.Contains($needle)) "contains: $needle"
 }

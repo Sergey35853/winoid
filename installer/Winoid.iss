@@ -1,6 +1,6 @@
 #define MyAppName "Winoid"
 #ifndef MyAppVersion
-  #define MyAppVersion "0.1.20"
+  #define MyAppVersion "0.1.21"
 #endif
 #define MyAppPublisher "Sergey35853"
 #define MyAppURL "https://github.com/Sergey35853/winoid"

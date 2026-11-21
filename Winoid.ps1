@@ -447,10 +447,11 @@ function Initialize-WinoidData {
 # Optional config: %LOCALAPPDATA%\Winoid\config.json
 # { "wslDistro": "Winoid", "adbSerial": "192.168.240.112:5555" }
 $script:dataRoot = Initialize-WinoidData
-$script:appVersion = '0.1.20'
+$script:appVersion = '0.1.21'
 $script:iconQueue = New-Object System.Collections.Queue
 $script:hideCaption = $false
 $script:captionHeightPx = 48
+$script:fallbackNavInset = 48
 $script:adbTimeoutMs = 10000
 $script:sessionTimeoutMs = 15000
 $script:configDir = $script:dataRoot
@@ -464,6 +465,7 @@ if (Test-Path -LiteralPath $script:configPath) {
         if ($cfg.sessionTimeoutMs) { $script:sessionTimeoutMs = [int]$cfg.sessionTimeoutMs }
         if ($null -ne $cfg -and ($cfg.PSObject.Properties.Name -contains 'hideCaption')) { $script:hideCaption = [bool]$cfg.hideCaption }
         if ($cfg.captionHeightPx) { $script:captionHeightPx = [int]$cfg.captionHeightPx }
+        if ($null -ne $cfg -and ($cfg.PSObject.Properties.Name -contains 'fallbackNavInset')) { $script:fallbackNavInset = [int]$cfg.fallbackNavInset }
         if ($cfg.armTranslator) { $script:armTranslator = [string]$cfg.armTranslator }
         if ($null -ne $cfg -and ($cfg.PSObject.Properties.Name -contains 'armCompat')) {
             $script:armCompat = [bool]$cfg.armCompat
@@ -504,6 +506,11 @@ function Save-ArmCompatSetting {
             $cfg.captionHeightPx = [int]$script:captionHeightPx
         } else {
             $cfg | Add-Member -NotePropertyName captionHeightPx -NotePropertyValue ([int]$script:captionHeightPx)
+        }
+        if ($cfg.PSObject.Properties.Name -contains 'fallbackNavInset') {
+            $cfg.fallbackNavInset = [int]$script:fallbackNavInset
+        } else {
+            $cfg | Add-Member -NotePropertyName fallbackNavInset -NotePropertyValue ([int]$script:fallbackNavInset)
         }
         $cfg | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $script:configPath -Encoding utf8NoBOM
     } catch {
@@ -819,6 +826,7 @@ $mainXaml = @'
         <CheckBox x:Name="RememberModeCheck" Content="Запоминать режим для каждого приложения" Foreground="#C9CDD4" Margin="2,0,0,12"/>
         <CheckBox x:Name="AutoHideCheck" Content="Скрывать индикатор после появления окна" Foreground="#C9CDD4" IsChecked="True" Margin="2,0,0,14"/>
         <CheckBox x:Name="HideCaptionCheck" Content="Обрезать заголовок Android (обычно не нужно)" Foreground="#C9CDD4" IsChecked="False" Margin="2,0,0,4"/>
+        <CheckBox x:Name="NavInsetCheck" Content="Обрезать нижнюю полосу Android" Foreground="#C9CDD4" IsChecked="True" Margin="2,0,0,4"/>
         <CheckBox x:Name="ArmCompatCheck" Content="Режим совместимости ARM" Foreground="#C9CDD4" Margin="2,0,0,4"/>
         <TextBlock x:Name="ArmCompatHint" Text="Помогает играм, которые зависают в ARM-трансляторе libndk. Медленнее, но надёжнее." TextWrapping="Wrap" FontSize="11" Foreground="#8D929C" Margin="24,0,0,14"/>
         <TextBlock x:Name="HintText" TextWrapping="Wrap" FontSize="12" Foreground="#A9AEBA"
@@ -1012,6 +1020,8 @@ $autoHideCheck = $window.FindName('AutoHideCheck')
 $armCompatCheck = $window.FindName('ArmCompatCheck')
 $hideCaptionCheck = $window.FindName('HideCaptionCheck')
 $hideCaptionCheck.IsChecked = [bool]$script:hideCaption
+$navInsetCheck = $window.FindName('NavInsetCheck')
+$navInsetCheck.IsChecked = ([int]$script:fallbackNavInset -gt 0)
 $armCompatCheck.IsChecked = [bool]$script:armCompat
 $armCompatHint = $window.FindName('ArmCompatHint')
 $footerText    = $window.FindName('FooterText')
@@ -2026,6 +2036,10 @@ function Get-AppPanes($app, [IntPtr]$source) {
         if ($inset -ge 20 -and $inset -le 140 -and $inset -gt $navInset) { $navInset = $inset }
         if ($ww -gt $displayW) { $displayW = $ww }
     }
+    # Some games do not expose a separate nav-bar window; their surface still
+    # ends with a dark decoration strip. Use a small fallback crop so it does
+    # not end up as a white-bordered black band under the game.
+    if ($navInset -eq 0 -and [int]$script:fallbackNavInset -gt 0) { $navInset = [int]$script:fallbackNavInset }
 
     $panes = New-Object System.Collections.ArrayList
     [void]$panes.Add([pscustomobject]@{ Source = $source; Left = $wr.Left; Top = $wr.Top; W = $pw; H = $ph })
@@ -2585,7 +2599,7 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
         if ($null -ne $cp -and [int]$cp.Value -gt $capMax) { $capMax = [int]$cp.Value }
     }
     if ($capMax -gt 0) { $srcH = [Math]::Max(1, $srcH - $capMax) }
-    try { Write-WinoidLog ("wrapper $($app.Package): frames=$($androidFrames.Count) panes=$paneInfo caption=$capMax") } catch { }
+    try { Write-WinoidLog ("wrapper $($app.Package): frames=$($androidFrames.Count) panes=$paneInfo caption=$capMax nav=$($spec.NavInset)") } catch { }
 
     $w = @{}
     $w.Package = $app.Package
@@ -4008,6 +4022,14 @@ $backendBtn.Add_Click({
 })
 $fullUiBtn.Add_Click({ Invoke-Safe 'restart' { Start-Session -Restart } })
 $settingsBtn.Add_Click({ Invoke-Safe 'settingsBtn' { Start-AndroidWindow 'com.android.settings' 'Настройки Android' } })
+$navInsetCheck.Add_Checked({ Invoke-Safe 'navInsetOn' {
+    $script:fallbackNavInset = 48; Save-ArmCompatSetting
+    Set-Footer 'Нижняя полоса Android будет обрезаться в новых окнах.'
+} })
+$navInsetCheck.Add_Unchecked({ Invoke-Safe 'navInsetOff' {
+    $script:fallbackNavInset = 0; Save-ArmCompatSetting
+    Set-Footer 'Нижняя полоса Android будет показана в новых окнах.'
+} })
 $hideCaptionCheck.Add_Checked({ Invoke-Safe 'captionOn' {
     $script:hideCaption = $true; Save-ArmCompatSetting
     Set-Footer 'Заголовок Android будет скрыт в новых окнах.'
