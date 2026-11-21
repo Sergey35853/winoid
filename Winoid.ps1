@@ -484,7 +484,7 @@ function Initialize-WinoidData {
 # Optional config: %LOCALAPPDATA%\Winoid\config.json
 # { "wslDistro": "Winoid", "adbSerial": "192.168.240.112:5555" }
 $script:dataRoot = Initialize-WinoidData
-$script:appVersion = '0.1.32'
+$script:appVersion = '0.1.34'
 $script:iconQueue = New-Object System.Collections.Queue
 $script:geometryPath = Join-Path $script:dataRoot 'geometry.json'
 $script:appGeometry = @{}
@@ -1162,6 +1162,7 @@ $script:wrapperXaml = @'
         </Grid.ColumnDefinitions>
         <StackPanel Orientation="Horizontal" VerticalAlignment="Center">
           <Button x:Name="GameModeBtn" Content="Игра" FontSize="11" Padding="8,5" ToolTip="Скрыть панель и растянуть картинку"/>
+          <Button x:Name="FitBtn" Content="Вписать" FontSize="11" Padding="8,5" ToolTip="Подогнать окно под пропорции игры"/>
           <Button x:Name="PhoneModeBtn" Content="Телефон" FontSize="11" Padding="8,5" ToolTip="Вертикальный режим 720 × 1280"/>
           <Button x:Name="TabletModeBtn" Content="Планшет" FontSize="11" Padding="8,5" ToolTip="Горизонтальный режим 1280 × 800"/>
           <Button x:Name="BackBtn" Content="◀  Назад" ToolTip="Назад в Android (Esc, Backspace или Alt+←)"/>
@@ -3019,6 +3020,7 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
     $navLabel = $win.FindName('NavLabel')
     $navPanel = $win.FindName('NavPanel')
     $gameModeBtn = $win.FindName('GameModeBtn')
+    $fitBtn = $win.FindName('FitBtn')
     $phoneModeBtn = $win.FindName('PhoneModeBtn')
     $tabletModeBtn = $win.FindName('TabletModeBtn')
 
@@ -3036,6 +3038,13 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
 
     if ($null -ne $loadingIcon) { $loadingIcon.Source = $script:appIcon }
 
+    $fitBtn.Add_Click({ Invoke-Safe 'fitWindow' {
+        $targetW = [int]$w.SrcW + 16
+        $targetH = [int]($targetW * $w.SrcH / $w.SrcW) + $script:wrapperNavHeight + 39
+        $win.Width = [Math]::Max(400, $targetW)
+        $win.Height = [Math]::Max(300, $targetH)
+        Set-Footer 'Окно подогнано под пропорции игры.'
+    } })
     $gameModeBtn.Add_Click({ Invoke-Safe 'gameMode' {
         $w.GameMode = -not [bool]$w.GameMode
         try {
@@ -3241,7 +3250,11 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
     if ($null -ne $size -and [int]$size.Width -gt 0) { $cw = [int]$size.Width; $ch = [int]$size.Height }
     elseif ($script:appGeometry.ContainsKey([string]$app.Package)) {
         $g = $script:appGeometry[[string]$app.Package]
-        $cw = [int]$g.W; $ch = [int]$g.H
+        $cw = [int]$g.W
+        # Keep the user's preferred width but always restore the content
+        # aspect ratio, otherwise a manually stretched window leaves huge
+        # black bars and the game looks clipped horizontally.
+        $ch = [int]($cw * $srcH / $srcW)
     }
     elseif ($app.Package -eq 'com.android.settings') {
         # Settings is a two-pane 2560x1392 desktop. At full size it would be
@@ -3570,6 +3583,11 @@ function Start-AppLaunch($app) {
     }
     $existing = Find-WrapperByPackage $app.Package
     if ($null -ne $existing) {
+        # A second launch request for an already open app must not leave the
+        # transparent loading window hanging over the game.
+        $loader.Hide()
+        $launchTimer.Stop()
+        $script:launchState = $null
         Focus-Wrapper $existing
         Set-Footer "Окно «$(Get-AppDisplayName $app)» уже открыто."
         return
@@ -4022,6 +4040,17 @@ function Try-PendingLaunch {
     if ($null -ne $script:launchState -and -not $script:launchState.Wrapped) { return }
 
     $target = $script:pendingLaunch
+    $already = Find-WrapperByPackage $target
+    if ($null -ne $already) {
+        # The app is already on screen - drop the stale request and hide the
+        # transparent loader instead of showing "starting" over the game.
+        $script:pendingLaunch = ''
+        $loader.Hide()
+        $launchTimer.Stop()
+        $script:launchState = $null
+        Focus-Wrapper $already
+        return
+    }
     $app = $script:apps | Where-Object { $_.Package -eq $target -or $_.Name -eq $target } | Select-Object -First 1
     if ($null -eq $app) {
         # The package list can be incomplete for a while on a cold boot. Keep
