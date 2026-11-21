@@ -182,6 +182,15 @@ public class NativeWin {
         }
     }
 
+    // Bring a wrapper above other windows even when Windows refuses to give
+    // us foreground rights (the manager is started by a hidden launcher).
+    public static void ForceTop(IntPtr h) {
+        if (h == IntPtr.Zero) return;
+        ShowWindow(h, 9);
+        SetWindowPos(h, new IntPtr(-1), 0, 0, 0, 0, 0x0001 | 0x0002);
+        SetWindowPos(h, new IntPtr(-2), 0, 0, 0, 0, 0x0001 | 0x0002);
+    }
+
     public static bool LeftButtonDown() {
         return (GetAsyncKeyState(0x01) & 0x8000) != 0;
     }
@@ -475,7 +484,7 @@ function Initialize-WinoidData {
 # Optional config: %LOCALAPPDATA%\Winoid\config.json
 # { "wslDistro": "Winoid", "adbSerial": "192.168.240.112:5555" }
 $script:dataRoot = Initialize-WinoidData
-$script:appVersion = '0.1.30'
+$script:appVersion = '0.1.31'
 $script:iconQueue = New-Object System.Collections.Queue
 $script:geometryPath = Join-Path $script:dataRoot 'geometry.json'
 $script:appGeometry = @{}
@@ -2763,7 +2772,9 @@ function Focus-Wrapper($w) {
     try {
         if ($w.Window.WindowState -eq 'Minimized') { $w.Window.WindowState = 'Normal' }
         $w.Window.Activate()
-        [NativeWin]::ForceForeground([System.Windows.Interop.WindowInteropHelper]::new($w.Window).Handle)
+        $handle = [System.Windows.Interop.WindowInteropHelper]::new($w.Window).Handle
+        [NativeWin]::ForceTop($handle)
+        [NativeWin]::ForceForeground($handle)
     } catch { }
 }
 
@@ -3433,6 +3444,7 @@ $script:frameTimer.Add_Tick({
             }
             if (-not $capture -or $lumaRows -eq 0) { continue }
             $w.Frames++
+            if ($w.Frames -eq 40) { Invoke-Safe 'refocus' { Focus-Wrapper $w } }
             if (-not $w.Settled -and ($w.Frames % 8) -eq 0) {
                 $elapsed = ([DateTime]::UtcNow - $w.LoadStart).TotalSeconds
                 # Dark apps (game menus, splash screens) are still content:
@@ -4550,7 +4562,8 @@ $window.Add_Drop({
 })
 $window.Add_Closing({
     $script:exiting = $true
-    Write-WinoidLog ("manager closing (user=" + $script:quitByUser + ")")
+    $stack = @(Get-PSCallStack | ForEach-Object { "$($_.Command):$($_.ScriptLineNumber)" }) -join ' <- '
+    Write-WinoidLog ("manager closing (user=" + $script:quitByUser + ") stack=" + $stack)
     try { if ($null -ne $script:tray) { $script:tray.Visible = $false; $script:tray.Dispose() } } catch { }
     try { if ($script:quitByUser) { [System.IO.File]::WriteAllText($script:quitPath, (Get-Date).ToString('o')) } } catch { }
     try { [System.IO.File]::WriteAllText($script:shutdownPath, (Get-Date).ToString('o')) } catch { }
