@@ -475,7 +475,7 @@ function Initialize-WinoidData {
 # Optional config: %LOCALAPPDATA%\Winoid\config.json
 # { "wslDistro": "Winoid", "adbSerial": "192.168.240.112:5555" }
 $script:dataRoot = Initialize-WinoidData
-$script:appVersion = '0.1.28'
+$script:appVersion = '0.1.29'
 $script:iconQueue = New-Object System.Collections.Queue
 $script:geometryPath = Join-Path $script:dataRoot 'geometry.json'
 $script:appGeometry = @{}
@@ -3673,6 +3673,7 @@ function Start-AppLaunch($app) {
         # waydroid app launch returns as soon as the request is accepted;
         # a bounded call is more reliable than a detached wsl.exe process.
         $null = Invoke-Wsl ((Get-WslBase) + @('--', 'bash', '-lc', $cmd)) 15000
+        Write-WinoidLog "launch sent: $($app.Package)"
     } catch {
         Write-WinoidLog ("ERROR launch " + $app.Package + ": " + $_.Exception.ToString())
         $launchTimer.Stop()
