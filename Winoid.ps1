@@ -447,11 +447,12 @@ function Initialize-WinoidData {
 # Optional config: %LOCALAPPDATA%\Winoid\config.json
 # { "wslDistro": "Winoid", "adbSerial": "192.168.240.112:5555" }
 $script:dataRoot = Initialize-WinoidData
-$script:appVersion = '0.1.21'
+$script:appVersion = '0.1.22'
 $script:iconQueue = New-Object System.Collections.Queue
 $script:hideCaption = $false
 $script:captionHeightPx = 48
 $script:fallbackNavInset = 48
+$script:edgeCropPx = 3
 $script:adbTimeoutMs = 10000
 $script:sessionTimeoutMs = 15000
 $script:configDir = $script:dataRoot
@@ -1987,9 +1988,17 @@ function Map-WrapperPoint($w, $pos) {
             $ty = $ty + $sy - $y0
             $cp = $pane.PSObject.Properties['CaptionInset']
             if ($null -ne $cp) { $ty += [int]$cp.Value }
+            $ep = $pane.PSObject.Properties['EdgeCrop']
+            if ($null -ne $ep) { $tx += [int]$ep.Value; $ty += [int]$ep.Value }
             return @($tx, $ty)
         }
-        return @($sx, $sy)
+        $cp2 = $pane.PSObject.Properties['CaptionInset']
+        $ep2 = $pane.PSObject.Properties['EdgeCrop']
+        $adjY = $sy
+        $adjX = $sx
+        if ($null -ne $cp2) { $adjY += [int]$cp2.Value }
+        if ($null -ne $ep2) { $adjX += [int]$ep2.Value; $adjY += [int]$ep2.Value }
+        return @($adjX, $adjY)
     }
     return $null
 }
@@ -2567,6 +2576,7 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
         $visH = [Math]::Max(1, $visH - $tb)
         [void]$pane.PSObject.Properties.Remove('Grab')
         $pane | Add-Member -NotePropertyName CaptionInset -NotePropertyValue $tb -Force
+        $pane | Add-Member -NotePropertyName EdgeCrop -NotePropertyValue ([int]$script:edgeCropPx) -Force
         $pane | Add-Member -NotePropertyName VX -NotePropertyValue $vx -Force
         $pane | Add-Member -NotePropertyName VY -NotePropertyValue $vy -Force
         $pane | Add-Member -NotePropertyName VisH -NotePropertyValue $visH -Force
@@ -2976,8 +2986,11 @@ $script:frameTimer.Add_Tick({
                 $capProp = $pane.PSObject.Properties['CaptionInset']
                 $capPx = 0
                 if ($null -ne $capProp) { $capPx = [int]$capProp.Value }
+                $ecProp = $pane.PSObject.Properties['EdgeCrop']
+                $ec = 0
+                if ($null -ne $ecProp) { $ec = [int]$ecProp.Value }
                 [void]$pane.Grab.Capture($pane.Source)
-                $srcRect = [System.Windows.Int32Rect]::new($cx, $cy + $capPx, $vw, $vh)
+                $srcRect = [System.Windows.Int32Rect]::new($cx + $ec, $cy + $capPx + $ec, [Math]::Max(1, $vw - 2 * $ec), [Math]::Max(1, $vh - 2 * $ec))
                 $w.Wb.WritePixels($srcRect, $pane.Grab.Bits, [int]$pane.Grab.ByteSize, $pane.Grab.Stride, [int]$pane.VX, [int]$pane.VY)
                 $lumaSum += $pane.Grab.MeanLuma() * $vh
                 $lumaRows += $vh
