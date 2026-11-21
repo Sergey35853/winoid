@@ -1905,56 +1905,136 @@ function Get-CachedLauncherApps {
     } catch { return @() }
 }
 
+# Applies the result of the background app-list job on the UI thread.
+function Apply-AppListResult($result) {
+    $generic = [System.Windows.Media.Imaging.BitmapFrame]::Create(
+        [Uri]::new((Join-Path $script:baseDir 'assets\android.ico')))
+    $list = New-Object System.Collections.ArrayList
+    foreach ($r in @($result)) {
+        if ([string]::IsNullOrWhiteSpace([string]$r.Package)) { continue }
+        $app = [pscustomobject]@{ Name = [string]$r.Name; Package = [string]$r.Package }
+        $path = [string]$r.IconPath
+        $icon = $generic
+        if ($path -and (Test-Path -LiteralPath $path)) {
+            try { $icon = [System.Windows.Media.Imaging.BitmapFrame]::Create([Uri]::new($path)) } catch { }
+        } else {
+            $script:iconQueue.Enqueue([string]$r.Package)
+        }
+        $app | Add-Member -MemberType NoteProperty -Name Icon -Value $icon -Force
+        [void]$list.Add($app)
+    }
+    $script:apps = @($list)
+    $cached = $false
+    if ($script:apps.Count -eq 0) {
+        $script:apps = @(Get-CachedLauncherApps)
+        $cached = $true
+    }
+    Update-AppFilter
+    Write-WinoidLog ("app list (async): " + $script:apps.Count + " apps, queued icons=" + $script:iconQueue.Count)
+    if ($script:apps.Count -eq 0) {
+        Set-Footer 'Список пуст. Android ещё запускается? Нажмите «Обновить».'
+    } elseif ($cached) {
+        Set-Footer 'Список приложений из кэша (Android не отвечает)'
+    } else {
+        Set-Footer "Приложений: $($script:apps.Count)"
+    }
+    if ($script:iconQueue.Count -gt 0) { $iconTimer.Start() }
+}
+
+# The WSL/ADB work runs in a background job; the dispatcher only applies the
+# finished list, so the manager window never freezes while it is read.
+$script:appsJob = $null
+$appsRefreshTimer = [System.Windows.Threading.DispatcherTimer]::new()
+$appsRefreshTimer.Interval = [TimeSpan]::FromMilliseconds(250)
+$appsRefreshTimer.Add_Tick({
+    Invoke-Safe 'appsRefresh' {
+        if ($null -eq $script:appsJob) { $appsRefreshTimer.Stop(); return }
+        $state = 'Unknown'
+        try { $state = [string]$script:appsJob.State } catch { }
+        if ($state -notin @('Completed', 'Failed', 'Stopped')) { return }
+        $appsRefreshTimer.Stop()
+        $result = @()
+        try { $result = @(Receive-Job -Job $script:appsJob -ErrorAction SilentlyContinue) } catch { }
+        try { Remove-Job -Job $script:appsJob -Force -ErrorAction SilentlyContinue } catch { }
+        $script:appsJob = $null
+        Apply-AppListResult $result
+    }
+})
+
 function Refresh-Apps {
     $script:iconAdbOffline = $false
     $script:iconQueue.Clear()
-    if (-not (Test-Backend)) {
-        $script:apps = @()
-        Update-AppFilter
-        $backendBtn.Visibility = 'Visible'
-        Set-Footer 'Waydroid не найден в WSL. Нажмите «Настроить Android» или откройте README.'
-        return
-    }
-    Set-Footer 'Чтение списка приложений…'
-
-    $script:apps = @(Get-LauncherApps)
-    if ($script:apps.Count -eq 0) {
-        # Fallback for an older helper build or a failed app_process run.
-        $cmd = 'export DISPLAY=:0 WAYLAND_DISPLAY=wayland-0 XDG_RUNTIME_DIR=/run/user/$(id -u); waydroid app list'
-        $r = Invoke-Wsl ((Get-WslBase) + @('--', 'bash', '-lc', $cmd)) 30000
-        if ($r.Code -eq 0 -and -not [string]::IsNullOrWhiteSpace($r.Out)) {
-            $list = New-Object System.Collections.ArrayList
-            $blocks = ($r.Out -split '(?m)^Name:\s*') | Select-Object -Skip 1
-            foreach ($b in $blocks) {
-                $name = (($b -split "`r?`n")[0]).Trim()
-                if ($b -notmatch 'packageName:\s*(\S+)') { continue }
-                $pkg = $matches[1].Trim()
-                if ($b -notmatch 'android\.intent\.category\.LAUNCHER') { continue }
-                [void]$list.Add([pscustomobject]@{ Name = $name; Package = $pkg })
-            }
-            $script:apps = @($list | Sort-Object Name)
-            foreach ($app in $script:apps) {
-                $app | Add-Member -MemberType NoteProperty -Name Icon -Value (Get-AppIconPath $app) -Force
-            }
-        }
-    }
-
-    if ($script:apps.Count -eq 0) {
-        # Waydroid freezes when idle; the DEX helper cannot answer then.
-        # Show the last good list with its cached icons instead of an empty one.
-        $script:apps = @(Get-CachedLauncherApps)
-        if ($script:apps.Count -gt 0) {
-            Update-AppFilter
-            Set-Footer 'Список приложений из кэша (Android не отвечает)'
+    if ($null -ne $script:appsJob) {
+        $state = 'Unknown'
+        try { $state = [string]$script:appsJob.State } catch { }
+        if ($state -notin @('Completed', 'Failed', 'Stopped')) {
+            Set-Footer 'Чтение списка приложений…'
             return
         }
-        Update-AppFilter
-        Set-Footer 'Список пуст. Android ещё запускается? Нажмите «Обновить».'
-        return
+        try { Remove-Job -Job $script:appsJob -Force -ErrorAction SilentlyContinue } catch { }
+        $script:appsJob = $null
     }
-    Update-AppFilter
-    Set-Footer "Приложений: $($script:apps.Count)"
-    if ($script:iconQueue.Count -gt 0) { $iconTimer.Start() }
+    Set-Footer 'Чтение списка приложений…'
+    $dexPath = Join-Path $script:baseDir 'assets\winoid-icon.dex'
+    $script:appsJob = Start-Job -ScriptBlock {
+        param([string]$Wsl, [string]$Distro, [string]$Serial, [string]$Dex, [string]$DataRoot)
+        function Invoke-W([string[]]$Args, [int]$Ms) {
+            $psi = [System.Diagnostics.ProcessStartInfo]::new()
+            $psi.FileName = $Wsl
+            foreach ($a in $Args) { [void]$psi.ArgumentList.Add($a) }
+            $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+            $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+            $p = [System.Diagnostics.Process]::Start($psi)
+            $o = $p.StandardOutput.ReadToEndAsync(); $e = $p.StandardError.ReadToEndAsync()
+            if (-not $p.WaitForExit($Ms)) { try { $p.Kill() } catch { }; return @{ Out = ''; Err = 'timeout'; Code = -1 } }
+            @{ Out = $o.Result; Err = $e.Result; Code = $p.ExitCode }
+        }
+        function Convert-LinuxPath([string]$Path) {
+            $full = [System.IO.Path]::GetFullPath($Path)
+            if ($full -match '^([A-Za-z]):\\(.*)$') { return '/mnt/' + $matches[1].ToLowerInvariant() + '/' + $matches[2].Replace('\', '/') }
+            return $full.Replace('\', '/')
+        }
+        $base = @(); if ($Distro) { $base = @('-d', $Distro) }
+        $check = Invoke-W ($base + @('--', 'bash', '-lc', 'command -v waydroid >/dev/null 2>&1 && echo WINOID_BACKEND_OK')) 10000
+        if ($check.Out -notmatch 'WINOID_BACKEND_OK') { return @() }
+        $remote = '/data/local/tmp/winoid-icon.dex'
+        $state = Invoke-W ($base + @('--', 'adb', '-s', $Serial, 'get-state')) 8000
+        if ($state.Out -notmatch 'device') {
+            $null = Invoke-W ($base + @('--', 'adb', 'connect', $Serial)) 10000
+            $state = Invoke-W ($base + @('--', 'adb', '-s', $Serial, 'get-state')) 8000
+        }
+        $apps = @()
+        if ($state.Out -match 'device') {
+            $linuxDex = Convert-LinuxPath $Dex
+            $null = Invoke-W ($base + @('--', 'adb', '-s', $Serial, 'push', $linuxDex, $remote)) 15000
+            $cmd = "CLASSPATH=$remote app_process /system/bin WinoidIcon --list"
+            $r = Invoke-W ($base + @('--', 'adb', '-s', $Serial, 'shell', $cmd)) 20000
+            foreach ($line in ($r.Out -split "`r?`n")) {
+                if ($line -match '^([^\t]+)\t(\S+)$') {
+                    $apps += [pscustomobject]@{ Name = $matches[1].Trim(); Package = $matches[2].Trim() }
+                }
+            }
+        }
+        if ($apps.Count -eq 0) {
+            $cmd = 'export DISPLAY=:0 WAYLAND_DISPLAY=wayland-0 XDG_RUNTIME_DIR=/run/user/$(id -u); waydroid app list'
+            $r = Invoke-W ($base + @('--', 'bash', '-lc', $cmd)) 30000
+            foreach ($b in (($r.Out -split '(?m)^Name:\s*') | Select-Object -Skip 1)) {
+                $name = (($b -split "`r?`n")[0]).Trim()
+                if ($b -notmatch 'packageName:\s*(\S+)') { continue }
+                if ($b -notmatch 'android\.intent\.category\.LAUNCHER') { continue }
+                $apps += [pscustomobject]@{ Name = $name; Package = $matches[1].Trim() }
+            }
+        }
+        $unique = @{}; foreach ($a in $apps) { if (-not $unique.ContainsKey($a.Package)) { $unique[$a.Package] = $a } }
+        $iconsDir = Join-Path $DataRoot 'icons'
+        $result = @()
+        foreach ($a in @($unique.Values | Sort-Object Name)) {
+            $ico = Join-Path $iconsDir ($a.Package + '.ico')
+            $result += [pscustomobject]@{ Name = $a.Name; Package = $a.Package; IconPath = $(if (Test-Path -LiteralPath $ico) { $ico } else { '' }) }
+        }
+        $result
+    } -ArgumentList @($script:wsl, $script:wslDistro, $script:adbSerial, $dexPath, $script:dataRoot)
+    $appsRefreshTimer.Start()
 }
 
 # A watchdog restart leaves WSLg windows parked off-screen by the previous
@@ -4437,6 +4517,18 @@ $window.Add_Closing({
         $script:frameTimer.Stop()
         $script:bounceTimer.Stop()
         $iconTimer.Stop()
+        $appsRefreshTimer.Stop()
+        $startupProbeTimer.Stop()
+        if ($null -ne $script:startupJob) {
+            try { Stop-Job -Job $script:startupJob -Force -ErrorAction SilentlyContinue } catch { }
+            try { Remove-Job -Job $script:startupJob -Force -ErrorAction SilentlyContinue } catch { }
+            $script:startupJob = $null
+        }
+        if ($null -ne $script:appsJob) {
+            try { Stop-Job -Job $script:appsJob -Force -ErrorAction SilentlyContinue } catch { }
+            try { Remove-Job -Job $script:appsJob -Force -ErrorAction SilentlyContinue } catch { }
+            $script:appsJob = $null
+        }
     }
     Invoke-Safe 'closing.drive' { Disconnect-AndroidDrive }
     foreach ($w in @($script:wrappers)) {
@@ -4467,17 +4559,77 @@ $window.Add_Closed({
         $window.Dispatcher.InvokeShutdown()
     }
 })
+$script:startupJob = $null
+$startupProbeTimer = [System.Windows.Threading.DispatcherTimer]::new()
+$startupProbeTimer.Interval = [TimeSpan]::FromMilliseconds(250)
+$startupProbeTimer.Add_Tick({
+    Invoke-Safe 'startupProbe' {
+        if ($null -eq $script:startupJob) { $startupProbeTimer.Stop(); return }
+        $state = 'Unknown'
+        try { $state = [string]$script:startupJob.State } catch { }
+        if ($state -notin @('Completed', 'Failed', 'Stopped')) { return }
+        $startupProbeTimer.Stop()
+        $r = $null
+        try { $r = @(Receive-Job -Job $script:startupJob -ErrorAction SilentlyContinue) | Select-Object -First 1 } catch { }
+        try { Remove-Job -Job $script:startupJob -Force -ErrorAction SilentlyContinue } catch { }
+        $script:startupJob = $null
+        if ($null -ne $r) {
+            $script:sessionRunning = ([string]$r.Session -eq 'RUNNING')
+            $script:containerState = [string]$r.Container
+            Update-ArmCompatUi
+            if ($script:sessionRunning) {
+                Set-Status 'Android работает' '#3DDC84'
+                $backendBtn.Visibility = 'Collapsed'
+            } elseif (-not $r.Backend) {
+                Set-Status 'Бэкенд не настроен' '#E5484D'
+                $backendBtn.Visibility = 'Visible'
+                Set-Footer 'Waydroid не найден в WSL. Нажмите «Настроить Android».'
+            } else {
+                Set-Status 'Android остановлен' '#F5A623'
+                $backendBtn.Visibility = 'Collapsed'
+            }
+            if ($script:sessionRunning) {
+                Invoke-Safe 'startup.apps' { Refresh-Apps }
+            } else {
+                Invoke-Safe 'startup.session' { Start-Session }
+            }
+        }
+    }
+})
+
+function Start-StartupProbe {
+    if ($null -ne $script:startupJob) { return }
+    $script:startupJob = Start-Job -ScriptBlock {
+        param([string]$Wsl, [string]$Distro)
+        function Invoke-W([string[]]$Args, [int]$Ms) {
+            $psi = [System.Diagnostics.ProcessStartInfo]::new()
+            $psi.FileName = $Wsl
+            foreach ($a in $Args) { [void]$psi.ArgumentList.Add($a) }
+            $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
+            $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+            $p = [System.Diagnostics.Process]::Start($psi)
+            $o = $p.StandardOutput.ReadToEndAsync(); $e = $p.StandardError.ReadToEndAsync()
+            if (-not $p.WaitForExit($Ms)) { try { $p.Kill() } catch { }; return @{ Out = ''; Err = 'timeout' } }
+            @{ Out = $o.Result; Err = $e.Result }
+        }
+        $base = @(); if ($Distro) { $base = @('-d', $Distro) }
+        $check = Invoke-W ($base + @('--', 'bash', '-lc', 'command -v waydroid >/dev/null 2>&1 && echo WINOID_BACKEND_OK')) 10000
+        $backend = ($check.Out -match 'WINOID_BACKEND_OK')
+        $session = 'STOPPED'; $container = 'UNKNOWN'
+        if ($backend) {
+            $r = Invoke-W ($base + @('-u', 'root', '--', 'waydroid', 'status')) 15000
+            if ($r.Out -match '(?m)^Session:\s*(\S+)') { $session = $matches[1] }
+            if ($r.Out -match '(?m)^Container:\s*(\S+)') { $container = $matches[1] }
+        }
+        [pscustomobject]@{ Backend = $backend; Session = $session; Container = $container }
+    } -ArgumentList @($script:wsl, $script:wslDistro)
+    $startupProbeTimer.Start()
+}
+
 $window.Add_Loaded({
     Invoke-Safe 'loaded.keepalive' { Start-WslKeepAlive }
     Invoke-Safe 'loaded.restore' { Restore-OrphanedParkedWindows }
-    Invoke-Safe 'loaded.session' { if (-not (Test-Session)) { Start-Session } }
-    # When Android is still booting, Refresh-Apps and Initialize-Adb would
-    # block the UI thread for tens of seconds before the session timer gets a
-    # chance to run. The timer repeats this work as soon as Waydroid is up.
-    if ($script:sessionRunning) {
-        Invoke-Safe 'loaded.apps' { Refresh-Apps }
-        Invoke-Safe 'loaded.adb' { Initialize-Adb }
-    }
+    Start-StartupProbe
     Invoke-Safe 'loaded.drive' { $driveTimer.Start() }
     if ($Install) {
         Invoke-Safe 'loaded.install' {
