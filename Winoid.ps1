@@ -560,7 +560,7 @@ function Initialize-WinoidData {
 # Optional config: %LOCALAPPDATA%\Winoid\config.json
 # { "wslDistro": "Winoid", "adbSerial": "192.168.240.112:5555" }
 $script:dataRoot = Initialize-WinoidData
-$script:appVersion = '0.1.44'
+$script:appVersion = '0.1.45'
 $script:iconQueue = New-Object System.Collections.Queue
 $script:geometryPath = Join-Path $script:dataRoot 'geometry.json'
 $script:appGeometry = @{}
@@ -3491,7 +3491,7 @@ $script:bounceTimer.Add_Tick({
 })
 
 $script:frameTimer = [System.Windows.Threading.DispatcherTimer]::new()
-$script:frameTimer.Interval = [TimeSpan]::FromMilliseconds(50)
+$script:frameTimer.Interval = [TimeSpan]::FromMilliseconds(33)
 $script:frameTimer.Add_Tick({
     try {
         $script:frameTick++
@@ -3563,7 +3563,10 @@ $script:frameTimer.Add_Tick({
                 [void]$pane.Grab.Capture($pane.Source)
                 $srcRect = [System.Windows.Int32Rect]::new($cx + $ec, $cy + $capPx + $ec, [Math]::Max(1, $vw - 2 * $ec), [Math]::Max(1, $vh - 2 * $ec))
                 $w.Wb.WritePixels($srcRect, $pane.Grab.Bits, [int]$pane.Grab.ByteSize, $pane.Grab.Stride, [int]$pane.VX, [int]$pane.VY)
-                $lumaSum += $pane.Grab.MeanLuma() * $vh
+                # Luma sampling costs ~30k unmanaged reads per pane. It is only
+                # needed until the loading overlay is hidden; skip it while
+                # playing so more CPU goes to the game and taps feel faster.
+                if (-not $w.Settled) { $lumaSum += $pane.Grab.MeanLuma() * $vh }
                 $lumaRows += $vh
             }
             foreach ($extra in @($w.Parked)) {
