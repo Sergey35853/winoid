@@ -69,6 +69,7 @@ Assert-True ($text.Contains('Get-LaunchCommand')) 'launch uses an explicitly res
 Assert-True ($text.Contains('launch frames for $pkg')) 'launch job collects Android window frames for tap mapping'
 Assert-True ($text.Contains('New-AppWrapper $st.App $h $st.Size $stFrames')) 'wrapper uses frames collected by the launch job'
 Assert-True ($text.Contains('full-size sub-surface')) 'duplicate full-size game surfaces are parked instead of left on the desktop'
+Assert-True ($text.Contains('$script:frameTick % 20')) 'inactive wrapper capture uses a time-based throttle'
 Assert-True ($text.Contains('ARM compatibility is synchronized by the background launch job')) 'ARM compatibility runs with the background launch job'
 $iconJobSrc = Get-Content -LiteralPath (Join-Path $root 'assets\iconjob.ps1') -Raw
 Assert-True ($iconJobSrc -match '\[string\]\$Lnk') 'icon worker works without a desktop shortcut'

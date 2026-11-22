@@ -478,6 +478,10 @@ $script:pendingLaunchTries = 0
 $script:lastErrorAt = [DateTime]::MinValue
 $script:lastErrorText = ''
 $script:frameErrorAt = [DateTime]::MinValue
+# Time-based throttle for inactive wrappers. Using w.Frames here deadlocks the
+# capture: once a wrapper loses focus, Frames stops growing, so Frames%20 never
+# becomes 0 again and a game's picture stays frozen forever.
+$script:frameTick = 0
 
 $script:wrappers = New-Object System.Collections.ArrayList
 $script:wrapByImage = @{}
@@ -556,7 +560,7 @@ function Initialize-WinoidData {
 # Optional config: %LOCALAPPDATA%\Winoid\config.json
 # { "wslDistro": "Winoid", "adbSerial": "192.168.240.112:5555" }
 $script:dataRoot = Initialize-WinoidData
-$script:appVersion = '0.1.43'
+$script:appVersion = '0.1.44'
 $script:iconQueue = New-Object System.Collections.Queue
 $script:geometryPath = Join-Path $script:dataRoot 'geometry.json'
 $script:appGeometry = @{}
@@ -3490,6 +3494,7 @@ $script:frameTimer = [System.Windows.Threading.DispatcherTimer]::new()
 $script:frameTimer.Interval = [TimeSpan]::FromMilliseconds(50)
 $script:frameTimer.Add_Tick({
     try {
+        $script:frameTick++
         $beatNow = [DateTime]::UtcNow
         if (($beatNow - $script:lastHeartbeat).TotalSeconds -ge 10) {
             $script:lastHeartbeat = $beatNow
@@ -3524,7 +3529,7 @@ $script:frameTimer.Add_Tick({
             # Only grab frames for the active wrapper at full rate; inactive
             # ones refresh occasionally so switching back is not stale.
             $capture = ($w.Window.IsVisible -and $w.Window.WindowState -ne 'Minimized' -and
-                        ($w.Window.IsActive -or (($w.Frames % 20) -eq 0)))
+                        ($w.Window.IsActive -or (($script:frameTick % 20) -eq 0)))
             $lumaSum = 0.0
             $lumaRows = 0
             foreach ($pane in @($w.Panes)) {
