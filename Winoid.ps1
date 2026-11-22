@@ -482,6 +482,10 @@ $script:frameErrorAt = [DateTime]::MinValue
 # capture: once a wrapper loses focus, Frames stops growing, so Frames%20 never
 # becomes 0 again and a game's picture stays frozen forever.
 $script:frameTick = 0
+# While the user is sending input we capture at 30 fps for low latency; the
+# rest of the time 20 fps leaves more CPU to the game (which is software
+# rendered under Waydroid).
+$script:inputBurstUntil = [DateTime]::MinValue
 
 $script:wrappers = New-Object System.Collections.ArrayList
 $script:wrapByImage = @{}
@@ -560,7 +564,7 @@ function Initialize-WinoidData {
 # Optional config: %LOCALAPPDATA%\Winoid\config.json
 # { "wslDistro": "Winoid", "adbSerial": "192.168.240.112:5555" }
 $script:dataRoot = Initialize-WinoidData
-$script:appVersion = '0.1.45'
+$script:appVersion = '0.1.50'
 $script:iconQueue = New-Object System.Collections.Queue
 $script:geometryPath = Join-Path $script:dataRoot 'geometry.json'
 $script:appGeometry = @{}
@@ -2358,6 +2362,9 @@ function Send-Android([string]$cmd) {
     # the WPF dispatcher never blocks on a busy or wedged adb shell (that is
     # what froze games right after a "Start" tap).
     try { $script:adb.Send($cmd) } catch { }
+    # Keep the fast capture rate for a moment after real input: the game's
+    # response should appear on screen with minimal delay.
+    $script:inputBurstUntil = [DateTime]::UtcNow.AddSeconds(2)
 }
 
 # Back only reaches the app that owns Android's input focus. Launching a
@@ -2603,7 +2610,9 @@ function Set-PaneAndroidFrames($panes, $frames) {
         $dw = $pw - [int]$best.W; $dh = $ph - [int]$best.H
         $ax = [int]$best.L; $ay = [int]$best.T
         if ($dw -gt 0) { $ax -= [int][math]::Round($dw / 2) }
-        elseif ($dw -lt 0) { $ax += -$dw }
+        # A pane NARROWER than the Android frame is a clipped WSLg surface,
+        # not a window with margins: keep the frame origin instead of shifting
+        # every tap to the right.
         if ($dh -gt 0) { $ay -= [int][math]::Round($dh / 2) }
         elseif ($dh -lt 0) { $ay += -$dh }
 
@@ -2907,6 +2916,27 @@ function New-AppWrapper($app, [IntPtr]$source, $size, $frames = $null) {
     if ($null -ne $frames) { $androidFrames = @($frames) }
     else { $androidFrames = @(Get-AndroidWindowFrames $app.Package) }
     Set-PaneAndroidFrames $panes $androidFrames
+    # WSLg sometimes creates the surface content-sized and clips the right or
+    # bottom of the Android frame. Grow it back before capture: otherwise the
+    # picture is cut off and the narrower pane shifts every tap to the right.
+    if ($androidFrames.Count -gt 0 -and $panes.Count -gt 0) {
+        $p0 = $panes[0]
+        $fit = $null; $fitDelta = 99999
+        foreach ($f in $androidFrames) {
+            $d = [math]::Abs([int]$p0.W - [int]$f.W) + [math]::Abs([int]$p0.H - [int]$f.H)
+            if ($d -lt $fitDelta) { $fit = $f; $fitDelta = $d }
+        }
+        if ($null -ne $fit -and ([int]$p0.W -lt [int]$fit.W - 8 -or [int]$p0.H -lt [int]$fit.H - 8)) {
+            [void][NativeWin]::SetWindowPos($p0.Source, [IntPtr]::Zero, 0, 0,
+                [int]$fit.W + 24, [int]$fit.H + 24, 0x0006)
+            [System.Threading.Thread]::Sleep(350)
+            $grown = New-Object NativeWin+RECT
+            [void][NativeWin]::GetClientRect($p0.Source, [ref]$grown)
+            if ($grown.Right -ge [int]$fit.W) { $p0.W = [int]$grown.Right }
+            if ($grown.Bottom -ge [int]$fit.H) { $p0.H = [int]$grown.Bottom }
+            Set-PaneAndroidFrames $panes $androidFrames
+        }
+    }
     # Settings is one Android window whose height is the freeform frame, not
     # the WSLg shadowed surface. Use the frame size for the wrapper so the
     # window keeps phone-like proportions instead of a 488x848 shadow box.
@@ -3491,10 +3521,16 @@ $script:bounceTimer.Add_Tick({
 })
 
 $script:frameTimer = [System.Windows.Threading.DispatcherTimer]::new()
-$script:frameTimer.Interval = [TimeSpan]::FromMilliseconds(33)
+$script:frameTimer.Interval = [TimeSpan]::FromMilliseconds(50)
 $script:frameTimer.Add_Tick({
     try {
         $script:frameTick++
+        # Adaptive capture: 30 fps during a short burst after input, 20 fps
+        # otherwise so the software-rendered game gets the freed-up CPU.
+        $wantMs = $(if ([DateTime]::UtcNow -lt $script:inputBurstUntil) { 33 } else { 50 })
+        if ($script:frameTimer.Interval.TotalMilliseconds -ne $wantMs) {
+            $script:frameTimer.Interval = [TimeSpan]::FromMilliseconds($wantMs)
+        }
         $beatNow = [DateTime]::UtcNow
         if (($beatNow - $script:lastHeartbeat).TotalSeconds -ge 10) {
             $script:lastHeartbeat = $beatNow
@@ -3702,12 +3738,18 @@ $script:launchWorker = {
     # activity and silently leaves Android on the home screen. Resolving the
     # activity with adb and starting it explicitly works reliably.
     function Get-LaunchCommand {
-        $r = Invoke-W ($base + @('--', 'adb', '-s', $serial, 'shell', 'cmd', 'package', 'resolve-activity', '--brief', $pkg)) 12000
-        if ($r.Code -eq 0) {
-            foreach ($line in ([string]$r.Out -split "`r?`n")) {
-                $t = $line.Trim()
-                if ($t -match '^[\w\.]+/[\w\.\$]+$') { return "adb -s $serial shell am start -n $t" }
+        # On a freshly started Waydroid session the package manager can take
+        # tens of seconds to index apps; until then resolve-activity reports
+        # "No activity found" and the app never opens.
+        for ($try = 0; $try -lt 12; $try++) {
+            $r = Invoke-W ($base + @('--', 'adb', '-s', $serial, 'shell', 'cmd', 'package', 'resolve-activity', '--brief', $pkg)) 12000
+            if ($r.Code -eq 0) {
+                foreach ($line in ([string]$r.Out -split "`r?`n")) {
+                    $t = $line.Trim()
+                    if ($t -match '^[\w\.]+/[\w\.\$]+$') { return "adb -s $serial shell am start -n $t" }
+                }
             }
+            Start-Sleep -Seconds 2
         }
         return $defaultLaunchCmd
     }
@@ -3720,6 +3762,8 @@ $script:launchWorker = {
             if ($s.Out -match '(?m)^Container:\s*RUNNING') { break }
         }
         Start-Sleep -Seconds 6
+        $null = Invoke-W ($base + @('--', 'adb', '-s', $serial, 'shell', 'wm', 'size', $sizeArg)) 10000
+        $null = Invoke-W ($base + @('--', 'adb', '-s', $serial, 'shell', 'wm', 'density', $densityArg)) 10000
         $useCmd = Get-LaunchCommand
         $null = Invoke-W ($base + @('--', 'bash', '-lc', $useCmd)) 15000
         [pscustomobject]@{ Ok = $true; Stage = 'retry'; Message = '' }
@@ -3817,10 +3861,10 @@ function Start-AndroidLaunchJob([string]$package, [string]$sizeArg, [string]$den
     )
 }
 
-function Start-AndroidRetryJob([string]$package, [string]$launchCmd) {
+function Start-AndroidRetryJob([string]$package, [string]$launchCmd, [string]$sizeArg, [string]$densityArg) {
     return Start-Job -ScriptBlock $script:launchWorker -ArgumentList @(
         'retry', $script:wsl, $script:wslDistro, $script:adbSerial,
-        $package, 'reset', 'reset', $launchCmd
+        $package, $sizeArg, $densityArg, $launchCmd
     )
 }
 
@@ -3975,7 +4019,7 @@ $launchTimer.Add_Tick({
         foreach ($wr in @($script:wrappers)) {
             Invoke-Safe 'retry.wrapper' { Remove-Wrapper $wr $true }
         }
-        $script:launchRetryJob = Start-AndroidRetryJob $st.App.Package ([string]$st.LaunchCmd)
+        $script:launchRetryJob = Start-AndroidRetryJob $st.App.Package ([string]$st.LaunchCmd) ([string]$st.SizeArg) ([string]$st.DensityArg)
     }
 
     if ($sec -ge 180) {
@@ -4059,6 +4103,10 @@ function Start-AppLaunch($app) {
             # WSLg window is only ~920x510. A lower density shrinks the UI so
             # the right-hand buttons fit inside the captured surface.
             if ([string]$app.Package -eq 'com.ihgames.im.android.google') {
+                # The game fixes its freeform window at x=1010 with ~970 px
+                # width. On a 1920 px wide Waydroid display its right side is
+                # cut off and taps shift; force the larger display geometry.
+                $sizeArg = '2560x1392'
                 $densityArg = '120'
             }
         } else {
@@ -4211,14 +4259,21 @@ function Install-Apk([string]$path) {
             param($mode, $exe, $distro, $serial, $apkPath, $logFile)
             $lines = New-Object System.Collections.ArrayList
             [void]$lines.Add("mode=$mode")
-            if ($mode -eq 'wsl') {
-                $wslArgs = @()
-                if (-not [string]::IsNullOrWhiteSpace($distro)) { $wslArgs += @('-d', $distro) }
-                $out = & $exe @wslArgs -- adb -s $serial install -r $apkPath 2>&1
-            } else {
-                $out = & $exe -s $serial install -r $apkPath 2>&1
+            # A freshly restarted Waydroid session can refuse the first
+            # install (adb returns -1 while the daemon is still coming up).
+            # Retry once before reporting failure.
+            $wslArgs = @()
+            if (-not [string]::IsNullOrWhiteSpace($distro)) { $wslArgs += @('-d', $distro) }
+            for ($attempt = 1; $attempt -le 2; $attempt++) {
+                if ($mode -eq 'wsl') {
+                    $out = & $exe @wslArgs -- adb -s $serial install -r $apkPath 2>&1
+                } else {
+                    $out = & $exe -s $serial install -r $apkPath 2>&1
+                }
+                $code = $LASTEXITCODE
+                if ($code -eq 0) { break }
+                Start-Sleep -Seconds 3
             }
-            $code = $LASTEXITCODE
             foreach ($l in @($out)) { [void]$lines.Add([string]$l) }
             [void]$lines.Add("install exit=$code")
             try {
