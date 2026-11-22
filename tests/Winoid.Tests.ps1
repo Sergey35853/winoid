@@ -26,7 +26,7 @@ foreach ($needle in @(
     'function Ensure-WaydroidAwake', 'function Get-CachedLauncherApps',
     'function Set-LiveDisplayMode', 'function Get-AppIconPath', 'function Show-Diagnostics',
     'function Restart-WaydroidSession', 'LaunchCmd = ', 'force-stop',
-    'x:Name="HideCaptionCheck"', 'CaptionInset', 'function Restore-OrphanedParkedWindows',
+    'x:Name="HideCaptionCheck"', 'CaptionInset', 'launch aborted: android did not wake',
     '$dy = $dir * $mag * 150', 'parked late surface',
     '$script:hideCaption = $false', 'x:Name="NavInsetCheck"', 'fallbackNavInset', 'EdgeCrop',
     'sub-surface', 'letterbox', 'StretchFillCheck', 'GameModeBtn',
@@ -36,6 +36,8 @@ foreach ($needle in @(
 )) {
     Assert-True ($text.Contains($needle)) "contains: $needle"
 }
+Assert-True (-not $text.Contains('Restore-OrphanedParkedWindows')) 'manager no longer unparks old game windows at startup'
+Assert-True (-not $text.Contains('restored orphan window')) 'manager does not restore orphaned surfaces on startup'
 
 # 3. Version consistency between the manager and the installer
 $iss = Get-Content -LiteralPath (Join-Path $root 'installer\Winoid.iss') -Raw
@@ -55,6 +57,8 @@ if (Test-Path -LiteralPath $stub) {
 Assert-True ((Get-Content -LiteralPath (Join-Path $root 'Winoid.cmd') -Raw).Contains('WinoidLauncher.exe')) 'Winoid.cmd uses the new launcher'
 Assert-True ($iss.Contains('WinoidLauncher.exe')) 'installer ships the new launcher'
 Assert-True ($text.Contains('shutdown.request')) 'manager writes the watchdog shutdown marker'
+$launcherSrc = Get-Content -LiteralPath (Join-Path $root 'tools\launcher\WinoidLauncher.cs') -Raw
+Assert-True ($launcherSrc.Contains('shutdown.request')) 'watchdog treats a normal window close as a clean shutdown'
 
 # 5. VBScript fallback keeps Windows-compliant quoting
 $vbs = Get-Content -LiteralPath (Join-Path $root 'Winoid.vbs') -Raw

@@ -484,7 +484,7 @@ function Initialize-WinoidData {
 # Optional config: %LOCALAPPDATA%\Winoid\config.json
 # { "wslDistro": "Winoid", "adbSerial": "192.168.240.112:5555" }
 $script:dataRoot = Initialize-WinoidData
-$script:appVersion = '0.1.38'
+$script:appVersion = '0.1.39'
 $script:iconQueue = New-Object System.Collections.Queue
 $script:geometryPath = Join-Path $script:dataRoot 'geometry.json'
 $script:appGeometry = @{}
@@ -1765,14 +1765,19 @@ function Get-WaydroidContainerStatus {
 }
 
 # Wake a suspended Android runtime before any operation that needs adb.
-# show-full-ui opens the launcher surface, which the manager already parks.
-function Ensure-WaydroidAwake([string]$package) {
+# Launching an app wakes the runtime without opening the Android launcher on
+# the desktop (unlike show-full-ui). Without a target package there is no
+# quiet way to thaw the container, so callers must either pass the package
+# they are about to use or opt in to the visible full-UI fallback.
+function Ensure-WaydroidAwake([string]$package, [switch]$AllowUi) {
     $state = Get-WaydroidContainerStatus
     if ($state -eq 'RUNNING') { return $true }
     if ($state -eq 'FROZEN') {
+        if ([string]::IsNullOrWhiteSpace($package) -and -not $AllowUi) {
+            Write-WinoidLog 'waydroid frozen: no target package for a quiet wake'
+            return $false
+        }
         Write-WinoidLog 'waydroid frozen: waking container quietly'
-        # Launching the target app wakes the runtime without opening the
-        # Android launcher on the desktop (unlike show-full-ui).
         $wakeCmd = if (-not [string]::IsNullOrWhiteSpace($package)) { "waydroid app launch $package" } else { 'waydroid show-full-ui' }
         try {
             $null = Invoke-Wsl ((Get-WslBase) + @('--', 'bash', '-lc', $wakeCmd)) 12000
@@ -2090,27 +2095,10 @@ function Refresh-Apps {
     $appsRefreshTimer.Start()
 }
 
-# A watchdog restart leaves WSLg windows parked off-screen by the previous
-# manager. Bring them back so a relaunch can find them again.
-function Restore-OrphanedParkedWindows {
-    $vs = [System.Windows.Forms.SystemInformation]::VirtualScreen
-    $threshold = $vs.Right + 100
-    foreach ($proc in @(Get-Process msrdc -ErrorAction SilentlyContinue)) {
-        $wins = @()
-        try { $wins = @([NativeWin]::ListWindows([uint32]$proc.Id)) } catch { continue }
-        foreach ($wnd in $wins) {
-            if ($null -eq $wnd -or -not $wnd.Visible) { continue }
-            $r = New-Object NativeWin+RECT
-            [void][NativeWin]::GetWindowRect($wnd.Hwnd, [ref]$r)
-            if ([int]$r.Left -lt $threshold) { continue }
-            $ex = [NativeWin]::GetWindowLong($wnd.Hwnd, -20)
-            $ex = ($ex -bor 0x00040000) -band (-bnot 0x00000080)
-            [void][NativeWin]::SetWindowLong($wnd.Hwnd, -20, $ex)
-            [void][NativeWin]::SetWindowPos($wnd.Hwnd, [IntPtr]::Zero, 0, 0, [int]$wnd.Width, [int]$wnd.Height, 0x0010)
-            Write-WinoidLog "restored orphan window: $($wnd.Title)"
-        }
-    }
-}
+# A watchdog restart used to unpark every WSLg window at startup, which made
+# a game that was still running in Waydroid pop up on the desktop by itself.
+# The launch path force-stops the activity and creates a fresh window, so the
+# manager now leaves orphaned surfaces parked off-screen.
 
 # Status can say RUNNING while the activity manager no longer creates WSLg
 # windows ("Sending reply failed"). Restarting the user session is the only
@@ -2133,16 +2121,16 @@ function Restart-WaydroidSession {
 # Switch phone/tablet geometry of a running wrapper without reopening it.
 function Set-LiveDisplayMode($w, [string]$mode) {
     if ($null -eq $w -or $w.Closed) { return }
-    if (-not (Ensure-WaydroidAwake)) {
+    if (-not (Ensure-WaydroidAwake ([string]$w.Package))) {
         Set-Footer 'Android не отвечает — не могу сменить режим.'
         return
     }
     try {
         if ($mode -eq 'phone') {
-            Set-AndroidDisplay '720x1280' '320'
+            Set-AndroidDisplay '720x1280' '320' ([string]$w.Package)
             Set-Footer 'Режим: телефон (вертикально 720 × 1280).'
         } else {
-            Set-AndroidDisplay '1280x800' '160'
+            Set-AndroidDisplay '1280x800' '160' ([string]$w.Package)
             Set-Footer 'Режим: планшет (горизонтально 1280 × 800).'
         }
     } catch {
@@ -2236,9 +2224,13 @@ function Initialize-Adb {
 }
 
 $script:displayOverridden = $false
-function Set-AndroidDisplay([string]$sizeArg, [string]$densityArg) {
+function Set-AndroidDisplay([string]$sizeArg, [string]$densityArg, [string]$package = '') {
     # A frozen container makes every adb call hang until its timeout.
-    Ensure-WaydroidAwake | Out-Null
+    # Pass the app package so the wake does not open the Android launcher.
+    if (-not (Ensure-WaydroidAwake $package)) {
+        Write-WinoidLog "display set skipped: android not awake (size=$sizeArg density=$densityArg)"
+        return $false
+    }
     if ($densityArg -ne 'reset') { $script:displayOverridden = $true }
     # Use a fresh adb client: the persistent shell can be stale after a
     # Waydroid session restart and silently swallow commands.
@@ -2249,6 +2241,7 @@ function Set-AndroidDisplay([string]$sizeArg, [string]$densityArg) {
         $null = Invoke-Wsl ((Get-WslBase) + @('--', 'adb', '-s', $script:adbSerial, 'shell', 'wm', 'density', $densityArg)) 10000
     } catch { Write-WinoidLog ("ERROR wm density: " + $_.Exception.Message) }
     Write-WinoidLog "display set: size=$sizeArg density=$densityArg"
+    return $true
 }
 
 function Send-Android([string]$cmd) {
@@ -2747,19 +2740,6 @@ function Sync-SettingsSurface($w) {
     $w.Panes = @($pane)
     $w.Source = $active.Hwnd
     try { Write-WinoidLog ("settings surface $('0x{0:X}' -f $active.Hwnd.ToInt64()) $($active.Width)x$($active.Height)") } catch { }
-}
-
-function Restore-Source($w) {
-    foreach ($pane in (@($w.Panes) + @($w.Parked))) {
-        if ($null -eq $pane -or -not [NativeWin]::IsWindow($pane.Source)) { continue }
-        [void][NativeWin]::SetWindowLong($pane.Source, -20, $pane.OrigExStyle)
-        $r = $pane.OrigRect
-        $wa = [System.Windows.Forms.Screen]::PrimaryScreen.WorkingArea
-        $x = $r.Left; $y = $r.Top
-        if ($x -ge $wa.Right -or $y -ge $wa.Bottom) { $x = 0; $y = 0 }
-        [void][NativeWin]::SetWindowPos($pane.Source, [IntPtr]::Zero, $x, $y, [Math]::Max(320, $r.Right - $r.Left), [Math]::Max(240, $r.Bottom - $r.Top), 0x0010)
-        if ($pane.WasZoomed) { [void][NativeWin]::ShowWindow($pane.Source, 3) }
-    }
 }
 
 function Remove-Wrapper($w, [bool]$closeSource) {
@@ -3664,7 +3644,13 @@ function Start-AppLaunch($app) {
 
     # Wake a frozen runtime first, otherwise wm size/density and the launch
     # itself would silently hang.
-    Ensure-WaydroidAwake ([string]$app.Package) | Out-Null
+    if (-not (Ensure-WaydroidAwake ([string]$app.Package))) {
+        Write-WinoidLog "launch aborted: android did not wake for $($app.Package)"
+        $loader.Hide()
+        $script:launchState = $null
+        Set-Footer 'Android не отвечает — попробуйте запустить ещё раз.'
+        return
+    }
 
     # Apply the display mode picked in the manager before the app starts:
     # phone = portrait + phone density, tablet = landscape + tablet density.
@@ -3676,13 +3662,13 @@ function Start-AppLaunch($app) {
             # WSLg window is only ~920x510. A lower density shrinks the UI so
             # the right-hand buttons fit inside the captured surface.
             if ([string]$app.Package -eq 'com.ihgames.im.android.google') {
-                Set-AndroidDisplay 'reset' '120'
+                Set-AndroidDisplay 'reset' '120' ([string]$app.Package)
             } else {
-                Set-AndroidDisplay 'reset' 'reset'
+                Set-AndroidDisplay 'reset' 'reset' ([string]$app.Package)
             }
         } else {
             $density = $(if ([int]$sizeChoice.Density -gt 0) { [string]$sizeChoice.Density } else { 'reset' })
-            Set-AndroidDisplay "$($sizeChoice.Width)x$($sizeChoice.Height)" $density
+            Set-AndroidDisplay "$($sizeChoice.Width)x$($sizeChoice.Height)" $density ([string]$app.Package)
         }
         Start-Sleep -Milliseconds 600
     }
@@ -4461,7 +4447,7 @@ $uninstallBtn.Add_Click({ Invoke-Safe 'uninstallBtn' {
     $names = ($apps | ForEach-Object { '• ' + [string]$_.Name + ' (' + [string]$_.Package + ')' }) -join "`n"
     $answer = [System.Windows.MessageBox]::Show("Удалить выбранные приложения?`n$names`n`nПриложения и их данные будут удалены из Android.", 'Winoid — удаление приложения', 'YesNo', 'Warning', 'No')
     if ($answer -ne [System.Windows.MessageBoxResult]::Yes) { return }
-    if (-not (Ensure-WaydroidAwake)) { Set-Footer 'Android не отвечает — удаление отменено.'; return }
+    if (-not (Ensure-WaydroidAwake -AllowUi)) { Set-Footer 'Android не отвечает — удаление отменено.'; return }
     $done = 0; $failed = 0
     foreach ($app in $apps) {
         $name = [string]$app.Name
@@ -4642,10 +4628,11 @@ $window.Add_Closing({
     Invoke-Safe 'closing.drive' { Disconnect-AndroidDrive }
     foreach ($w in @($script:wrappers)) {
         Invoke-Safe 'closing.wrapper' {
-            Restore-Source $w
-            $w.Closed = $true
-            foreach ($pane in @($w.Panes)) { try { $pane.Grab.Dispose() } catch { } }
-            try { $w.Window.Close() } catch { }
+            # Do not unpark the raw Android surface here: restoring it would
+            # leave an unmanaged game window on the desktop after Winoid
+            # exits. Closing the source windows keeps the desktop clean and
+            # the next launch starts a fresh Android window anyway.
+            Remove-Wrapper $w $true
         }
     }
     Invoke-Safe 'closing.adb' {
@@ -4745,7 +4732,6 @@ $window.Add_Loaded({
         }
     }
     Invoke-Safe 'loaded.keepalive' { Start-WslKeepAlive }
-    Invoke-Safe 'loaded.restore' { Restore-OrphanedParkedWindows }
     Start-StartupProbe
     Invoke-Safe 'loaded.drive' { $driveTimer.Start() }
     if ($Install) {

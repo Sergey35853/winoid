@@ -7,8 +7,10 @@ using System.Windows.Forms;
 
 namespace Winoid {
     // Tiny replacement for the deprecated VBScript launcher. Starts the
-    // hidden manager, then restarts it if it exits without a clean shutdown
-    // request (the manager writes shutdown.request when the user closes it).
+    // hidden manager, then restarts it only if it exits without a clean
+    // shutdown request. The manager writes shutdown.request from its Closing
+    // handler, so closing the Winoid window stops the watchdog instead of
+    // bringing the app back a few seconds later.
     internal static class Launcher {
         [STAThread]
         private static void Main(string[] args) {
@@ -17,7 +19,8 @@ namespace Winoid {
             string data = Path.Combine(Environment.GetFolderPath(
                 Environment.SpecialFolder.LocalApplicationData), "Winoid");
             try { Directory.CreateDirectory(data); } catch { }
-            string quit = Path.Combine(data, "quit.request");
+            string shutdown = Path.Combine(data, "shutdown.request");
+            string legacyQuit = Path.Combine(data, "quit.request");
 
             if (!File.Exists(script)) {
                 MessageBox.Show("Winoid.ps1 not found in " + dir, "Winoid",
@@ -30,7 +33,10 @@ namespace Winoid {
             string[] firstArgs = args;
             bool first = true;
             for (;;) {
-                try { if (File.Exists(quit)) File.Delete(quit); } catch { }
+                try {
+                    if (File.Exists(shutdown)) File.Delete(shutdown);
+                    if (File.Exists(legacyQuit)) File.Delete(legacyQuit);
+                } catch { }
 
                 Process proc;
                 try {
@@ -58,12 +64,12 @@ namespace Winoid {
                     var fi = new FileInfo(log);
                     if (fi.Exists && fi.Length > 1048576) File.Delete(log);
                     File.AppendAllText(log, DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") +
-                        " manager exited; restart=" + !File.Exists(quit) + Environment.NewLine);
+                        " manager exited; restart=" + !(File.Exists(shutdown) || File.Exists(legacyQuit)) + Environment.NewLine);
                 } catch { }
                 Thread.Sleep(2500);
 
                 bool clean = false;
-                try { clean = File.Exists(quit); } catch { }
+                try { clean = File.Exists(shutdown) || File.Exists(legacyQuit); } catch { }
                 if (clean) break;
             }
         }
