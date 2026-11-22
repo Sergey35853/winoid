@@ -57,8 +57,16 @@ if (Test-Path -LiteralPath $stub) {
 Assert-True ((Get-Content -LiteralPath (Join-Path $root 'Winoid.cmd') -Raw).Contains('WinoidLauncher.exe')) 'Winoid.cmd uses the new launcher'
 Assert-True ($iss.Contains('WinoidLauncher.exe')) 'installer ships the new launcher'
 Assert-True ($text.Contains('shutdown.request')) 'manager writes the watchdog shutdown marker'
+Assert-True ($text.Contains('FindMainWindow')) 'manager finds its real window instead of a message box'
+Assert-True ($text.Contains('closingStarted')) 'manager closes only once'
+Assert-True ($text.Contains('Complete-IconJob')) 'icons are extracted without blocking the window'
+$iconJobSrc = Get-Content -LiteralPath (Join-Path $root 'assets\iconjob.ps1') -Raw
+Assert-True ($iconJobSrc -match '\[string\]\$Lnk') 'icon worker works without a desktop shortcut'
 $launcherSrc = Get-Content -LiteralPath (Join-Path $root 'tools\launcher\WinoidLauncher.cs') -Raw
 Assert-True ($launcherSrc.Contains('shutdown.request')) 'watchdog treats a normal window close as a clean shutdown'
+Assert-True ($launcherSrc.Contains('WinoidLauncher')) 'watchdog allows only one instance'
+Assert-True ($launcherSrc.Contains('QueueRequest')) 'second launch forwards -Launch to the running manager'
+Assert-True ($launcherSrc.Contains('fastFailures')) 'watchdog stops a crash loop'
 
 # 5. VBScript fallback keeps Windows-compliant quoting
 $vbs = Get-Content -LiteralPath (Join-Path $root 'Winoid.vbs') -Raw

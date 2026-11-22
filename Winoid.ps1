@@ -16,6 +16,29 @@ public class WinoidActivate {
     [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern IntPtr FindWindow(string cls, string title);
     [DllImport("user32.dll")] public static extern bool ShowWindow(IntPtr h, int cmd);
     [DllImport("user32.dll")] public static extern bool SetForegroundWindow(IntPtr h);
+    public delegate bool EnumProc(IntPtr h, IntPtr l);
+    [DllImport("user32.dll")] public static extern bool EnumWindows(EnumProc cb, IntPtr l);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetWindowText(IntPtr h, StringBuilder s, int n);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern int GetClassName(IntPtr h, StringBuilder s, int n);
+
+    // FindWindow(null, "Winoid") cannot be called from PowerShell: $null is
+    // marshalled as an empty class name, so it never matches the real window.
+    // It used to fall through to a modal "already running" box, and a hidden
+    // watchdog-launched process then waited on that box forever.
+    public static IntPtr FindMainWindow() {
+        IntPtr found = IntPtr.Zero;
+        EnumWindows(delegate(IntPtr h, IntPtr l) {
+            var text = new StringBuilder(256);
+            GetWindowText(h, text, text.Capacity);
+            if (text.ToString() != "Winoid") return true;
+            var cls = new StringBuilder(256);
+            GetClassName(h, cls, cls.Capacity);
+            if (!cls.ToString().StartsWith("HwndWrapper")) return true;
+            found = h;
+            return false;
+        }, IntPtr.Zero);
+        return found;
+    }
 }
 public class WinoidDrive {
     [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode, EntryPoint = "DefineDosDeviceW")]
@@ -52,13 +75,24 @@ if (-not $script:instanceMutex.WaitOne(0)) {
             $queued = $true
         } catch { }
     }
-    $existing = [WinoidActivate]::FindWindow($null, 'Winoid')
+    $existing = [WinoidActivate]::FindMainWindow()
+    # The primary instance can still be building its window when a shortcut
+    # fires; retry briefly instead of falling through to a modal dialog.
+    for ($i = 0; $i -lt 12 -and $existing -eq [IntPtr]::Zero; $i++) {
+        Start-Sleep -Milliseconds 250
+        $existing = [WinoidActivate]::FindMainWindow()
+    }
     if ($existing -ne [IntPtr]::Zero) {
         [void][WinoidActivate]::ShowWindow($existing, 9)
         [void][WinoidActivate]::SetForegroundWindow($existing)
-    } elseif (-not $queued) {
-        [System.Windows.MessageBox]::Show('Winoid уже запущен.', 'Winoid') | Out-Null
     }
+    # Never show a message box here: the watchdog starts this process hidden,
+    # so a modal box would leave an invisible pwsh.exe alive forever and the
+    # watchdog would keep restarting it.
+    try {
+        $log = Join-Path $env:LOCALAPPDATA 'Winoid\winoid.log'
+        [System.IO.File]::AppendAllText($log, ("{0} secondary instance: window={1} queued={2}`r`n" -f (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'), $existing, $queued))
+    } catch { }
     exit
 }
 
@@ -484,7 +518,7 @@ function Initialize-WinoidData {
 # Optional config: %LOCALAPPDATA%\Winoid\config.json
 # { "wslDistro": "Winoid", "adbSerial": "192.168.240.112:5555" }
 $script:dataRoot = Initialize-WinoidData
-$script:appVersion = '0.1.39'
+$script:appVersion = '0.1.40'
 $script:iconQueue = New-Object System.Collections.Queue
 $script:geometryPath = Join-Path $script:dataRoot 'geometry.json'
 $script:appGeometry = @{}
@@ -1385,6 +1419,7 @@ $script:heartbeatPath = Join-Path $script:dataRoot 'heartbeat'
 $script:shutdownPath = Join-Path $script:dataRoot 'shutdown.request'
 $script:quitPath = Join-Path $script:dataRoot 'quit.request'
 $script:quitByUser = $false
+$script:closingStarted = $false
 $script:lastHeartbeat = [DateTime]::MinValue
 try { Remove-Item -LiteralPath $script:shutdownPath -Force -ErrorAction SilentlyContinue } catch { }
 
@@ -1940,12 +1975,26 @@ function Get-CachedLauncherApps {
     try {
         $items = @(Get-Content -LiteralPath $cache -Raw -Encoding utf8 | ConvertFrom-Json)
         $result = New-Object System.Collections.ArrayList
+        $generic = [System.Windows.Media.Imaging.BitmapFrame]::Create(
+            [Uri]::new((Join-Path $script:baseDir 'assets\android.ico')))
+        $iconsDir = Join-Path $script:dataRoot 'icons'
         foreach ($it in $items) {
             if ([string]::IsNullOrWhiteSpace([string]$it.Package)) { continue }
             $app = [pscustomobject]@{ Name = [string]$it.Name; Package = [string]$it.Package }
-            $app | Add-Member -MemberType NoteProperty -Name Icon -Value (Get-AppIconPath $app) -Force
+            # Never call ADB from the startup path: a missing cached icon
+            # would freeze the window until every timeout expired. Show the
+            # bundled icon and let the background icon queue fill it in.
+            $icon = $generic
+            $ico = Join-Path $iconsDir ($app.Package + '.ico')
+            if (Test-Path -LiteralPath $ico) {
+                try { $icon = [System.Windows.Media.Imaging.BitmapFrame]::Create([Uri]::new($ico)) } catch { }
+            } else {
+                if (-not $script:iconQueue.Contains($app.Package)) { $script:iconQueue.Enqueue($app.Package) }
+            }
+            $app | Add-Member -MemberType NoteProperty -Name Icon -Value $icon -Force
             [void]$result.Add($app)
         }
+        if ($script:iconQueue.Count -gt 0) { $iconTimer.Start() }
         return @($result)
     } catch { return @() }
 }
@@ -2231,7 +2280,7 @@ function Set-AndroidDisplay([string]$sizeArg, [string]$densityArg, [string]$pack
         Write-WinoidLog "display set skipped: android not awake (size=$sizeArg density=$densityArg)"
         return $false
     }
-    if ($densityArg -ne 'reset') { $script:displayOverridden = $true }
+    if ($sizeArg -ne 'reset' -or $densityArg -ne 'reset') { $script:displayOverridden = $true }
     # Use a fresh adb client: the persistent shell can be stale after a
     # Waydroid session restart and silently swallow commands.
     try {
@@ -3287,19 +3336,80 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
     return $w
 }
 
-# Extract app icons one at a time in the background. The slow ADB calls no
-# longer block the manager window during a refresh.
+# Extract app icons one at a time in a separate hidden process. ADB and WSL
+# calls can take seconds; running them on the dispatcher froze the window for
+# every missing icon. The timer only starts/collects the worker and loads the
+# finished .ico file.
+$script:iconJob = $null
+$script:iconJobPkg = ''
+$script:iconJobIco = ''
+$script:iconJobStart = [DateTime]::MinValue
+
+function Set-AppIconFromFile([string]$pkg, [string]$ico) {
+    if (-not (Test-Path -LiteralPath $ico)) { return $false }
+    try {
+        $frame = [System.Windows.Media.Imaging.BitmapFrame]::Create([Uri]::new($ico))
+        foreach ($item in $script:apps) {
+            if ([string]$item.Package -eq $pkg) { $item.Icon = $frame }
+        }
+        $appsList.Items.Refresh()
+        return $true
+    } catch { return $false }
+}
+
+function Complete-IconJob {
+    if ($null -eq $script:iconJob) { return $false }
+    $done = $false
+    try { $done = $script:iconJob.HasExited } catch { $done = $true }
+    if (-not $done -and ((Get-Date) - $script:iconJobStart).TotalSeconds -gt 45) {
+        try { $script:iconJob.Kill($true) } catch { try { $script:iconJob.Kill() } catch { } }
+        $done = $true
+    }
+    if (-not $done) { return $false }
+    try { $script:iconJob.Dispose() } catch { }
+    $pkg = $script:iconJobPkg
+    $ico = $script:iconJobIco
+    $script:iconJob = $null
+    $script:iconJobPkg = ''
+    $script:iconJobIco = ''
+    if ($pkg) { [void](Set-AppIconFromFile $pkg $ico) }
+    return $true
+}
+
 $iconTimer = [System.Windows.Threading.DispatcherTimer]::new()
 $iconTimer.Interval = [TimeSpan]::FromMilliseconds(600)
 $iconTimer.Add_Tick({
     Invoke-Safe 'iconTimer' {
+        if (Complete-IconJob) { return }
+        if ($null -ne $script:iconJob) { return }
         if ($script:iconQueue.Count -eq 0) { $iconTimer.Stop(); return }
         $pkg = [string]$script:iconQueue.Dequeue()
-        $frame = Get-AppIconPath ([pscustomobject]@{ Package = $pkg })
-        foreach ($item in $script:apps) {
-            if ([string]$item.Package -eq $pkg) { $item.Icon = $frame }
+        $iconsDir = Join-Path $script:dataRoot 'icons'
+        if (-not (Test-Path -LiteralPath $iconsDir)) { New-Item -ItemType Directory -Path $iconsDir -Force | Out-Null }
+        $ico = Join-Path $iconsDir ($pkg + '.ico')
+        if (Set-AppIconFromFile $pkg $ico) { return }
+
+        $worker = Join-Path $script:baseDir 'assets\iconjob.ps1'
+        $dex = Join-Path $script:baseDir 'assets\winoid-icon.dex'
+        if (-not (Test-Path -LiteralPath $worker) -or -not (Test-Path -LiteralPath $dex)) { $iconTimer.Stop(); return }
+        try {
+            $args = @(
+                '-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', $worker,
+                '-Package', $pkg,
+                '-Serial', $script:adbSerial,
+                '-WslExe', $script:wsl,
+                '-Distro', $script:wslDistro,
+                '-Dex', $dex,
+                '-Ico', $ico
+            )
+            $quoted = @($args | ForEach-Object { '"' + ([string]$_) + '"' })
+            $script:iconJob = Start-Process -FilePath 'pwsh.exe' -ArgumentList $quoted -WindowStyle Hidden -PassThru
+            $script:iconJobPkg = $pkg
+            $script:iconJobIco = $ico
+            $script:iconJobStart = Get-Date
+        } catch {
+            $script:iconJob = $null
         }
-        try { $appsList.Items.Refresh() } catch { }
     }
 })
 
@@ -4594,11 +4704,23 @@ $window.Add_Drop({
     }
 })
 $window.Add_Closing({
+    param($sender, $e)
+    # A second WM_CLOSE can arrive while the first handler is still cleaning
+    # up (slow WSL calls pump messages). Cancel it: cleanup must run once and
+    # the window must not close underneath its own handler.
+    if ($script:closingStarted) { $e.Cancel = $true; return }
+    $script:closingStarted = $true
     $script:exiting = $true
     $stack = @(Get-PSCallStack | ForEach-Object { "$($_.Command):$($_.ScriptLineNumber)" }) -join ' <- '
     Write-WinoidLog ("manager closing (user=" + $script:quitByUser + ") stack=" + $stack)
     if ($script:displayOverridden) {
-        try { $null = Invoke-Wsl ((Get-WslBase) + @('--', 'adb', '-s', $script:adbSerial, 'shell', 'wm', 'density', 'reset')) 8000 } catch { }
+        # Reset in a detached process with its own timeout. Blocking the close
+        # for 8 s made the window look hung (and let a second close re-enter).
+        try {
+            $serial = $script:adbSerial
+            Start-WslDetached ((Get-WslBase) + @('--', 'bash', '-lc', "timeout 5 adb -s $serial shell wm size reset; timeout 5 adb -s $serial shell wm density reset"))
+        } catch { }
+        $script:displayOverridden = $false
     }
     try { if ($null -ne $script:tray) { $script:tray.Visible = $false; $script:tray.Dispose() } } catch { }
     try { if ($script:quitByUser) { [System.IO.File]::WriteAllText($script:quitPath, (Get-Date).ToString('o')) } } catch { }
@@ -4641,6 +4763,11 @@ $window.Add_Closing({
     Invoke-Safe 'closing.jobs' {
         if ($script:installJob) { Remove-Job -Job $script:installJob -Force -ErrorAction SilentlyContinue }
         if ($script:sessionJob) { Remove-Job -Job $script:sessionJob -Force -ErrorAction SilentlyContinue }
+        if ($script:iconJob) {
+            try { $script:iconJob.Kill($true) } catch { try { $script:iconJob.Kill() } catch { } }
+            try { $script:iconJob.Dispose() } catch { }
+            $script:iconJob = $null
+        }
         if ($script:wslKeepAlive) {
             try { if (-not $script:wslKeepAlive.HasExited) { $script:wslKeepAlive.Kill() } } catch { }
             try { $script:wslKeepAlive.Dispose() } catch { }

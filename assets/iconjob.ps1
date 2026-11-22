@@ -5,7 +5,7 @@ param(
     [string]$Distro = '',
     [Parameter(Mandatory = $true)][string]$Dex,
     [Parameter(Mandatory = $true)][string]$Ico,
-    [Parameter(Mandatory = $true)][string]$Lnk,
+    [string]$Lnk = '',
     [string]$Generic = ''
 )
 
@@ -122,7 +122,7 @@ try {
     Write-Log "start $Package"
 
     if (-not (Test-Path -LiteralPath $Dex)) { throw "dex missing: $Dex" }
-    if (-not (Test-Path -LiteralPath $Lnk)) { throw "shortcut missing: $Lnk" }
+    if (-not [string]::IsNullOrWhiteSpace($Lnk) -and -not (Test-Path -LiteralPath $Lnk)) { throw "shortcut missing: $Lnk" }
 
     $script:Base = @()
     if (-not [string]::IsNullOrWhiteSpace($Distro)) { $script:Base = @('-d', $Distro) }
@@ -152,9 +152,11 @@ try {
     if (-not (Test-Path -LiteralPath $Ico)) { throw 'ico not created' }
 
     $ws = New-Object -ComObject WScript.Shell
-    $sc = $ws.CreateShortcut($Lnk)
-    $sc.IconLocation = "$Ico,0"
-    $sc.Save()
+    if (-not [string]::IsNullOrWhiteSpace($Lnk)) {
+        $sc = $ws.CreateShortcut($Lnk)
+        $sc.IconLocation = "$Ico,0"
+        $sc.Save()
+    }
     Write-Log "ok $Package -> $Ico"
 } catch {
     Write-Log "error $Package : $($_.Exception.Message)"
