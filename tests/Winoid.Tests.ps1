@@ -60,6 +60,11 @@ Assert-True ($text.Contains('shutdown.request')) 'manager writes the watchdog sh
 Assert-True ($text.Contains('FindMainWindow')) 'manager finds its real window instead of a message box'
 Assert-True ($text.Contains('closingStarted')) 'manager closes only once'
 Assert-True ($text.Contains('Complete-IconJob')) 'icons are extracted without blocking the window'
+Assert-True ($text.Contains('Start-AndroidLaunchJob $app.Package')) 'app launch runs in a background job'
+Assert-True ($text.Contains('Complete-LaunchPrepJob')) 'launch job is collected by the timer'
+Assert-True ($text.Contains('$st.Prepared')) 'window is wrapped only after the final launch command'
+Assert-True ($text.Contains('Stop-LaunchJobs')) 'launch jobs are stopped on close or a new launch'
+Assert-True ($text.Contains('ARM compatibility is synchronized by the background launch job')) 'ARM compatibility runs with the background launch job'
 $iconJobSrc = Get-Content -LiteralPath (Join-Path $root 'assets\iconjob.ps1') -Raw
 Assert-True ($iconJobSrc -match '\[string\]\$Lnk') 'icon worker works without a desktop shortcut'
 $launcherSrc = Get-Content -LiteralPath (Join-Path $root 'tools\launcher\WinoidLauncher.cs') -Raw

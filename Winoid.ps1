@@ -424,6 +424,9 @@ $script:wsl = "$env:SystemRoot\System32\wsl.exe"
 $script:sessionRunning = $false
 $script:apps = @()
 $script:launchState = $null
+$script:launchPrepJob = $null
+$script:launchRetryJob = $null
+$script:launchPrepStart = [DateTime]::MinValue
 $script:pendingAndroidWindow = $null
 $script:installJob = $null
 $script:installTicks = 0
@@ -518,7 +521,7 @@ function Initialize-WinoidData {
 # Optional config: %LOCALAPPDATA%\Winoid\config.json
 # { "wslDistro": "Winoid", "adbSerial": "192.168.240.112:5555" }
 $script:dataRoot = Initialize-WinoidData
-$script:appVersion = '0.1.40'
+$script:appVersion = '0.1.41'
 $script:iconQueue = New-Object System.Collections.Queue
 $script:geometryPath = Join-Path $script:dataRoot 'geometry.json'
 $script:appGeometry = @{}
@@ -1800,10 +1803,9 @@ function Get-WaydroidContainerStatus {
 }
 
 # Wake a suspended Android runtime before any operation that needs adb.
-# Launching an app wakes the runtime without opening the Android launcher on
-# the desktop (unlike show-full-ui). Without a target package there is no
-# quiet way to thaw the container, so callers must either pass the package
-# they are about to use or opt in to the visible full-UI fallback.
+# Unfreezing the container is quiet: it does not open the Android launcher.
+# An app launch is kept as a fallback because it also thaws some sessions;
+# show-full-ui is only used when the caller explicitly allows visible UI.
 function Ensure-WaydroidAwake([string]$package, [switch]$AllowUi) {
     $state = Get-WaydroidContainerStatus
     if ($state -eq 'RUNNING') { return $true }
@@ -1813,10 +1815,25 @@ function Ensure-WaydroidAwake([string]$package, [switch]$AllowUi) {
             return $false
         }
         Write-WinoidLog 'waydroid frozen: waking container quietly'
-        $wakeCmd = if (-not [string]::IsNullOrWhiteSpace($package)) { "waydroid app launch $package" } else { 'waydroid show-full-ui' }
         try {
-            $null = Invoke-Wsl ((Get-WslBase) + @('--', 'bash', '-lc', $wakeCmd)) 12000
+            $null = Invoke-Wsl ((Get-WslBase -Root) + @('--', 'waydroid', 'container', 'unfreeze')) 20000
         } catch { }
+        for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Milliseconds 700
+            if ((Get-WaydroidContainerStatus) -eq 'RUNNING') {
+                Write-WinoidLog 'waydroid awake'
+                return $true
+            }
+        }
+        if (-not [string]::IsNullOrWhiteSpace($package)) {
+            try {
+                $null = Invoke-Wsl ((Get-WslBase) + @('--', 'bash', '-lc', "waydroid app launch $package")) 20000
+            } catch { }
+        } elseif ($AllowUi) {
+            try {
+                $null = Invoke-Wsl ((Get-WslBase) + @('--', 'bash', '-lc', 'waydroid show-full-ui')) 20000
+            } catch { }
+        }
         for ($i = 0; $i -lt 14; $i++) {
             Start-Sleep -Milliseconds 700
             if ((Get-WaydroidContainerStatus) -eq 'RUNNING') {
@@ -3602,10 +3619,196 @@ $script:frameTimer.Add_Tick({
     }
 })
 
+# The slow half of a launch (wake, display size/density, force-stop and the
+# waydroid launch itself) runs in a background job. The manager window stays
+# responsive and the launch timer wraps the window as soon as Android creates
+# it, instead of freezing the UI for 5-20 seconds.
+$script:launchWorker = {
+    param($mode, $wslExe, $distro, $serial, $pkg, $sizeArg, $densityArg, $launchCmd, [bool]$CompatEnabled = $false, [bool]$CompatApplied = $false)
+    function Invoke-W([string[]]$Arguments, [int]$Ms) {
+        $psi = [System.Diagnostics.ProcessStartInfo]::new()
+        $psi.FileName = $wslExe
+        foreach ($a in $Arguments) { [void]$psi.ArgumentList.Add([string]$a) }
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $psi.RedirectStandardOutput = $true
+        $psi.RedirectStandardError = $true
+        $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+        $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
+        $p = [System.Diagnostics.Process]::Start($psi)
+        $o = $p.StandardOutput.ReadToEndAsync()
+        $e = $p.StandardError.ReadToEndAsync()
+        if (-not $p.WaitForExit($Ms)) {
+            try { $p.Kill($true) } catch { try { $p.Kill() } catch { } }
+            return [pscustomobject]@{ Out = ''; Err = 'timeout'; Code = -1 }
+        }
+        return [pscustomobject]@{ Out = $o.Result; Err = $e.Result; Code = $p.ExitCode }
+    }
+    $base = @(); if (-not [string]::IsNullOrWhiteSpace($distro)) { $base = @('-d', $distro) }
+    $root = @('-u', 'root')
+
+    if ($mode -eq 'retry') {
+        $null = Invoke-W ($base + @('--', 'bash', '-lc', 'systemctl --user restart waydroid-session.service')) 30000
+        for ($i = 0; $i -lt 50; $i++) {
+            Start-Sleep -Milliseconds 1000
+            $s = Invoke-W ($base + $root + @('--', 'waydroid', 'status')) 15000
+            if ($s.Out -match '(?m)^Container:\s*RUNNING') { break }
+        }
+        Start-Sleep -Seconds 6
+        $null = Invoke-W ($base + @('--', 'bash', '-lc', $launchCmd)) 15000
+        [pscustomobject]@{ Ok = $true; Stage = 'retry'; Message = '' }
+        return
+    }
+
+    # Apply the ARM compatibility mode inside the background job as well, so
+    # a mode switch cannot freeze the manager window during the launch.
+    $armAppliedNow = $CompatApplied
+    if ($CompatApplied -ne $CompatEnabled) {
+        $armMode = if ($CompatEnabled) { 'light-translate-or-interpret' } else { 'two-gear' }
+        $armCmd = "lxc-unfreeze -P /var/lib/waydroid/lxc -n waydroid >/dev/null 2>&1; " +
+            "echo WINOID_MODE_BEFORE_BEGIN; lxc-attach -P /var/lib/waydroid/lxc -n waydroid -- getprop ndk_translation.mode 2>/dev/null; " +
+            "echo WINOID_MODE_BEFORE_END; " +
+            "lxc-attach -P /var/lib/waydroid/lxc -n waydroid -- setprop ndk_translation.mode $armMode 2>/dev/null; " +
+            "echo WINOID_MODE_AFTER_BEGIN; lxc-attach -P /var/lib/waydroid/lxc -n waydroid -- getprop ndk_translation.mode 2>/dev/null; " +
+            "echo WINOID_MODE_AFTER_END"
+        $armRes = Invoke-W ($base + @('--', 'bash', '-lc', $armCmd)) 15000
+        $armText = $armRes.Out + "`n" + $armRes.Err
+        $armAfter = ''
+        if ($armText -match '(?s)WINOID_MODE_AFTER_BEGIN\s*(.*?)\s*WINOID_MODE_AFTER_END') { $armAfter = $matches[1].Trim() }
+        if ($armRes.Code -eq 0 -and $armAfter -eq $armMode) { $armAppliedNow = $true } else { $armAppliedNow = $false }
+    }
+
+    $container = 'UNKNOWN'
+    $status = Invoke-W ($base + $root + @('--', 'waydroid', 'status')) 15000
+    if ($status.Out -match '(?m)^Container:\s*(\S+)') { $container = $matches[1] }
+    if ($container -eq 'FROZEN') {
+        # Unfreeze the container directly. 'waydroid app launch' can block
+        # until Android is ready; killing it at the old 12 s timeout left the
+        # container frozen and the launch failed.
+        $null = Invoke-W ($base + $root + @('--', 'waydroid', 'container', 'unfreeze')) 20000
+        for ($i = 0; $i -lt 30; $i++) {
+            Start-Sleep -Milliseconds 700
+            $status = Invoke-W ($base + $root + @('--', 'waydroid', 'status')) 15000
+            if ($status.Out -match '(?m)^Container:\s*RUNNING') { $container = 'RUNNING'; break }
+        }
+        if ($container -ne 'RUNNING') {
+            # Fallback for a session that only thaws on an app request.
+            $null = Invoke-W ($base + @('--', 'bash', '-lc', "waydroid app launch $pkg")) 20000
+            for ($i = 0; $i -lt 14; $i++) {
+                Start-Sleep -Milliseconds 700
+                $status = Invoke-W ($base + $root + @('--', 'waydroid', 'status')) 15000
+                if ($status.Out -match '(?m)^Container:\s*RUNNING') { $container = 'RUNNING'; break }
+            }
+        }
+    }
+    if ($container -ne 'RUNNING') {
+        [pscustomobject]@{ Ok = $false; Stage = 'wake'; Message = "Android не проснулся ($container)" }
+        return
+    }
+
+    # Always send both: 'reset' restores the physical display, a concrete
+    # value applies the mode picked in the manager.
+    $null = Invoke-W ($base + @('--', 'adb', '-s', $serial, 'shell', 'wm', 'size', $sizeArg)) 10000
+    $null = Invoke-W ($base + @('--', 'adb', '-s', $serial, 'shell', 'wm', 'density', $densityArg)) 10000
+    Start-Sleep -Milliseconds 600
+    # A stale activity with no WSLg surface never creates a new window.
+    $null = Invoke-W ($base + @('--', 'adb', '-s', $serial, 'shell', 'am', 'force-stop', $pkg)) 8000
+    Start-Sleep -Milliseconds 350
+    $r = Invoke-W ($base + @('--', 'bash', '-lc', $launchCmd)) 15000
+    [pscustomobject]@{ Ok = $true; Stage = 'launched'; Code = $r.Code; Message = (($r.Out + ' ' + $r.Err).Trim()); CompatApplied = $armAppliedNow }
+}
+
+function Start-AndroidLaunchJob([string]$package, [string]$sizeArg, [string]$densityArg, [string]$launchCmd) {
+    return Start-Job -ScriptBlock $script:launchWorker -ArgumentList @(
+        'prepare', $script:wsl, $script:wslDistro, $script:adbSerial,
+        $package, $sizeArg, $densityArg, $launchCmd,
+        [bool]$script:armCompat, [bool]$script:armCompatApplied
+    )
+}
+
+function Start-AndroidRetryJob([string]$package, [string]$launchCmd) {
+    return Start-Job -ScriptBlock $script:launchWorker -ArgumentList @(
+        'retry', $script:wsl, $script:wslDistro, $script:adbSerial,
+        $package, 'reset', 'reset', $launchCmd
+    )
+}
+
+function Stop-LaunchJobs([string]$ForceStopPackage = '') {
+    foreach ($name in @('launchPrepJob', 'launchRetryJob')) {
+        $job = Get-Variable -Name $name -Scope Script -ValueOnly -ErrorAction SilentlyContinue
+        if ($null -eq $job) { continue }
+        try { Stop-Job -Job $job -Force -ErrorAction SilentlyContinue } catch { }
+        try { Remove-Job -Job $job -Force -ErrorAction SilentlyContinue } catch { }
+        Set-Variable -Name $name -Scope Script -Value $null
+    }
+    if (-not [string]::IsNullOrWhiteSpace($ForceStopPackage)) {
+        # Stopping the job does not always stop its wsl.exe child: the app can
+        # still open after Winoid exits. Kill it shortly after the cancel.
+        try {
+            $serial = $script:adbSerial
+            Start-WslDetached ((Get-WslBase -Root) + @('--', 'bash', '-lc',
+                "sleep 4; timeout 8 adb -s $serial shell am force-stop $ForceStopPackage"))
+        } catch { }
+    }
+}
+
+function Complete-LaunchPrepJob {
+    if ($null -eq $script:launchPrepJob) { return }
+    $state = 'Unknown'
+    try { $state = [string]$script:launchPrepJob.State } catch { }
+    $timedOut = ((Get-Date) - $script:launchPrepStart).TotalSeconds -gt 75
+    if ($state -notin @('Completed', 'Failed', 'Stopped') -and -not $timedOut) { return }
+
+    $result = $null
+    if (-not $timedOut) {
+        try { $result = @(Receive-Job -Job $script:launchPrepJob -ErrorAction SilentlyContinue) | Select-Object -Last 1 } catch { }
+    }
+    try { Remove-Job -Job $script:launchPrepJob -Force -ErrorAction SilentlyContinue } catch { }
+    $script:launchPrepJob = $null
+    if ($null -eq $script:launchState) { return }
+
+    $pkg = [string]$script:launchState.App.Package
+    if ($timedOut) {
+        Write-WinoidLog "launch prep timed out: $pkg"
+        $loader.Hide(); $launchTimer.Stop(); $script:launchState = $null
+        Set-Footer 'Android не ответил за 75 секунд. Попробуйте ещё раз.'
+        return
+    }
+    if ($null -eq $result -or -not $result.Ok) {
+        $why = $(if ($null -ne $result) { [string]$result.Message } else { 'неизвестная ошибка' })
+        if ([string]::IsNullOrWhiteSpace($why)) { $why = 'неизвестная ошибка' }
+        if ($null -ne $result -and [string]$result.Stage -eq 'wake') {
+            Write-WinoidLog "launch aborted: android did not wake for $pkg"
+        }
+        Write-WinoidLog "launch prep failed: $pkg $why"
+        $loader.Hide(); $launchTimer.Stop(); $script:launchState = $null
+        Set-Footer "Не удалось запустить: $why"
+        return
+    }
+    $script:launchState.Prepared = $true
+    Write-WinoidLog "launch sent: $pkg (size=$($script:launchState.SizeArg) density=$($script:launchState.DensityArg))"
+    $script:armCompatApplied = [bool]$result.CompatApplied
+}
+
+function Complete-LaunchRetryJob {
+    if ($null -eq $script:launchRetryJob) { return }
+    $state = 'Unknown'
+    try { $state = [string]$script:launchRetryJob.State } catch { }
+    if ($state -notin @('Completed', 'Failed', 'Stopped')) { return }
+    try { Receive-Job -Job $script:launchRetryJob -ErrorAction SilentlyContinue | Out-Null } catch { }
+    try { Remove-Job -Job $script:launchRetryJob -Force -ErrorAction SilentlyContinue } catch { }
+    $script:launchRetryJob = $null
+    # The retry restarted the session; the persistent adb shell is stale.
+    if ($script:adb) { try { $script:adb.Dispose() } catch { }; $script:adb = $null }
+    Write-WinoidLog 'launch retry finished'
+}
+
 $launchTimer = [System.Windows.Threading.DispatcherTimer]::new()
 $launchTimer.Interval = [TimeSpan]::FromSeconds(1)
 $launchTimer.Add_Tick({
     Invoke-Safe 'launchTimer' {
+    Complete-LaunchPrepJob
+    Complete-LaunchRetryJob
     if (-not $script:launchState) { $launchTimer.Stop(); return }
     $st = $script:launchState
     $st.Ticks++
@@ -3617,63 +3820,71 @@ $launchTimer.Add_Tick({
     elseif ($sec -eq 30) { $loaderSub.Text = 'Идёт первый запуск. Android распаковывает данные и транслирует ARM-код — это может занять несколько минут.' }
     elseif ($sec -eq 90) { $loaderSub.Text = 'Всё ещё загружается. Не закрывайте приложение; индикатор можно скрыть.' }
 
-    $h = [NativeWin]::FindWindowContains($st.WindowMatch, 'Winoid')
-    if ($h -ne [IntPtr]::Zero) {
-        $st.Hwnd = $h
-        if (-not $st.Wrapped) {
-            # Settings now uses one Android frame, so there is no second
-            # side-by-side pane to wait for; Sync-SettingsSurface follows
-            # sub-screens after the wrapper exists. On a fresh boot Settings
-            # briefly paints a wide tablet layout before Android applies the
-            # freeform frame; wait for the portrait surface so the wrapper
-            # is not built around the wrong geometry.
-            $ready = $true
-            if ($st.App.Package -eq 'com.android.settings' -and $st.SeekTicks -lt 30) {
-                $cr = New-Object NativeWin+RECT
-                [void][NativeWin]::GetClientRect($h, [ref]$cr)
-                if ($cr.Right -le 0 -or $cr.Bottom -le 0) { $ready = $false }
-                elseif (($cr.Right / $cr.Bottom) -gt 0.8) { $ready = $false }
-                # Without the Android frame the tap mapping would use 0,0
-                # and every click would land near the top-left of Android.
-                $frames = @(Get-AndroidWindowFrames $st.App.Package)
-                if ($frames.Count -eq 0) { $ready = $false }
-            }
-            $st.SeekTicks++
-            if ($ready) {
-                $w = New-AppWrapper $st.App $h $st.Size
-                if ($null -ne $w) {
-                    $st.Wrapped = $true
-                    Set-Footer "Окно «$(Get-AppDisplayName $st.App)» открыто."
+    # Do not look for a window until the background launch has sent the final
+    # command. Waking a frozen container briefly starts the app at the old
+    # display size; wrapping that first surface would give the wrong geometry.
+    if ($st.Prepared) {
+        $h = [NativeWin]::FindWindowContains($st.WindowMatch, 'Winoid')
+        if ($h -ne [IntPtr]::Zero) {
+            $st.Hwnd = $h
+            if (-not $st.Wrapped) {
+                # Settings now uses one Android frame, so there is no second
+                # side-by-side pane to wait for; Sync-SettingsSurface follows
+                # sub-screens after the wrapper exists. On a fresh boot Settings
+                # briefly paints a wide tablet layout before Android applies the
+                # freeform frame; wait for the portrait surface so the wrapper
+                # is not built around the wrong geometry.
+                $ready = $true
+                if ($st.App.Package -eq 'com.android.settings' -and $st.SeekTicks -lt 30) {
+                    $cr = New-Object NativeWin+RECT
+                    [void][NativeWin]::GetClientRect($h, [ref]$cr)
+                    if ($cr.Right -le 0 -or $cr.Bottom -le 0) { $ready = $false }
+                    elseif (($cr.Right / $cr.Bottom) -gt 0.8) { $ready = $false }
+                    # Without the Android frame the tap mapping would use 0,0
+                    # and every click would land near the top-left of Android.
+                    $frames = @(Get-AndroidWindowFrames $st.App.Package)
+                    if ($frames.Count -eq 0) { $ready = $false }
+                }
+                $st.SeekTicks++
+                if ($ready) {
+                    $w = New-AppWrapper $st.App $h $st.Size
+                    if ($null -ne $w) {
+                        $st.Wrapped = $true
+                        Set-Footer "Окно «$(Get-AppDisplayName $st.App)» открыто."
+                    }
                 }
             }
-        }
-        if ($st.Wrapped) {
-            if ($autoHideCheck.IsChecked) {
-                $loader.Hide()
-                $launchTimer.Stop()
-            } else {
-                $loaderSub.Text = 'Окно открыто. Если оно чёрное — приложение ещё загружается; первый запуск может быть долгим.'
+            if ($st.Wrapped) {
+                if ($autoHideCheck.IsChecked) {
+                    $loader.Hide()
+                    $launchTimer.Stop()
+                } else {
+                    $loaderSub.Text = 'Окно открыто. Если оно чёрное — приложение ещё загружается; первый запуск может быть долгим.'
+                }
             }
         }
     }
 
     # No window after 30 s: the activity is usually still alive but its WSLg
     # surface is gone (msrdc restart / manager watchdog restart). Resuming it
-    # never creates a window, so force-stop once and launch again.
-    if ($sec -eq 35 -and -not $st.Wrapped -and -not $st.Retried) {
+    # never creates a window, so force-stop once and launch again. The restart
+    # runs in a job: it can take a minute and must not freeze the window.
+    if ($st.Prepared -and $sec -ge 35 -and -not $st.Wrapped -and -not $st.Retried -and
+        $null -eq $script:launchPrepJob -and $null -eq $script:launchRetryJob) {
         $st.Retried = $true
         Write-WinoidLog "launch retry: $($st.App.Package) (no window after 35s)"
         $loaderSub.Text = 'Окно не появилось — перезапускаю Android и приложение…'
         foreach ($wr in @($script:wrappers)) {
             Invoke-Safe 'retry.wrapper' { Remove-Wrapper $wr $true }
         }
-        Restart-WaydroidSession
-        try { $null = Invoke-Wsl ((Get-WslBase) + @('--', 'bash', '-lc', [string]$st.LaunchCmd)) 15000 } catch { }
+        $script:launchRetryJob = Start-AndroidRetryJob $st.App.Package ([string]$st.LaunchCmd)
     }
 
     if ($sec -ge 180) {
         $loader.Hide()
         $launchTimer.Stop()
+        Stop-LaunchJobs
+        $script:launchState = $null
         Set-Footer 'Окно не появилось за 3 минуты. Проверьте состояние Android.'
     }
     }
@@ -3681,11 +3892,9 @@ $launchTimer.Add_Tick({
 
 function Start-AppLaunch($app) {
     if ($null -eq $app) { return }
-    if (-not (Test-Backend)) {
-        $backendBtn.Visibility = 'Visible'
-        Set-Footer 'Waydroid не найден в WSL. Нажмите «Настроить Android» или откройте README.'
-        return
-    }
+    # The startup/session probe already keeps sessionRunning current. A direct
+    # Test-Backend here was another WSL round-trip on the UI thread before the
+    # launch; if Android is gone the background job reports it instead.
     if (-not $script:sessionRunning) {
         Set-PendingLaunch $app.Package
         if (-not $sessionTimer.IsEnabled) { Start-Session }
@@ -3722,15 +3931,44 @@ function Start-AppLaunch($app) {
         }
     }
 
-    $compatNote = ''
-    try {
-        if (-not (Sync-ArmCompatMode $app.Package)) {
-            $compatNote = ' (режим совместимости ARM недоступен)'
-        }
-    } catch {
-        $compatNote = ' (режим совместимости ARM недоступен)'
-        Write-WinoidLog ("ERROR ARM compat before launch: " + $_.Exception.ToString())
+    # ARM compatibility is synchronized by the background launch job so a
+    # mode switch cannot freeze the manager window during the launch.
+    $compatNote = $(if ($script:armCompat) { ' (режим совместимости ARM включён)' } else { '' })
+
+    # A different app requested while the previous launch is still being
+    # prepared: drop the old job first, otherwise its completion would clear
+    # the new launch state. Its wsl.exe child may still open the old app, so
+    # ask Android to stop that package shortly afterwards.
+    $oldPending = ''
+    if ($null -ne $script:launchState -and -not $script:launchState.Wrapped) {
+        $oldPending = [string]$script:launchState.App.Package
     }
+    if ($oldPending -and $oldPending -ne [string]$app.Package) {
+        Stop-LaunchJobs -ForceStopPackage $oldPending
+    } else {
+        Stop-LaunchJobs
+    }
+
+    # Decide the display mode on the UI thread (it reads the combo box), but
+    # apply it inside the job together with the wake and the launch. Doing it
+    # here froze the window for several seconds on every start.
+    $sizeChoice = Get-SelectedSize
+    $sizeArg = 'reset'
+    $densityArg = 'reset'
+    if ($null -ne $sizeChoice) {
+        if ($sizeChoice.Reset) {
+            # The game lays out its UI for the full 1920x1032 display but the
+            # WSLg window is only ~920x510. A lower density shrinks the UI so
+            # the right-hand buttons fit inside the captured surface.
+            if ([string]$app.Package -eq 'com.ihgames.im.android.google') {
+                $densityArg = '120'
+            }
+        } else {
+            $sizeArg = "$($sizeChoice.Width)x$($sizeChoice.Height)"
+            $densityArg = $(if ([int]$sizeChoice.Density -gt 0) { [string]$sizeChoice.Density } else { 'reset' })
+        }
+    }
+    if ($sizeArg -ne 'reset' -or $densityArg -ne 'reset') { $script:displayOverridden = $true }
 
     $script:launchState = [pscustomobject]@{
         App = $app
@@ -3738,9 +3976,12 @@ function Start-AppLaunch($app) {
         SeekTicks = 0
         Hwnd = [IntPtr]::Zero
         Wrapped = $false
+        Prepared = $false
         Retried = $false
         LaunchCmd = ''
-        Size = Get-SelectedSize
+        Size = $sizeChoice
+        SizeArg = $sizeArg
+        DensityArg = $densityArg
         # The WSLg title is the localized Android window title, e.g.
         # "Настройки (Ubuntu-24.04)" or "Infinite Magicraid (Ubuntu-24.04)".
         # Matching the English "Settings" made the launch wait forever on a
@@ -3751,46 +3992,6 @@ function Start-AppLaunch($app) {
         $script:appModes[[string]$app.Package] = [int]$sizeBox.SelectedIndex
         Save-AppModes
     }
-
-    # Wake a frozen runtime first, otherwise wm size/density and the launch
-    # itself would silently hang.
-    if (-not (Ensure-WaydroidAwake ([string]$app.Package))) {
-        Write-WinoidLog "launch aborted: android did not wake for $($app.Package)"
-        $loader.Hide()
-        $script:launchState = $null
-        Set-Footer 'Android не отвечает — попробуйте запустить ещё раз.'
-        return
-    }
-
-    # Apply the display mode picked in the manager before the app starts:
-    # phone = portrait + phone density, tablet = landscape + tablet density.
-    # "Как есть" restores the Android defaults instead of leaving the last mode.
-    $sizeChoice = $script:launchState.Size
-    if ($null -ne $sizeChoice) {
-        if ($sizeChoice.Reset) {
-            # The game lays out its UI for the full 1920x1032 display but the
-            # WSLg window is only ~920x510. A lower density shrinks the UI so
-            # the right-hand buttons fit inside the captured surface.
-            if ([string]$app.Package -eq 'com.ihgames.im.android.google') {
-                Set-AndroidDisplay 'reset' '120' ([string]$app.Package)
-            } else {
-                Set-AndroidDisplay 'reset' 'reset' ([string]$app.Package)
-            }
-        } else {
-            $density = $(if ([int]$sizeChoice.Density -gt 0) { [string]$sizeChoice.Density } else { 'reset' })
-            Set-AndroidDisplay "$($sizeChoice.Width)x$($sizeChoice.Height)" $density ([string]$app.Package)
-        }
-        Start-Sleep -Milliseconds 600
-    }
-
-    # A previous launch can leave the Android activity alive with no WSLg
-    # surface at all (window died with msrdc or the manager was restarted).
-    # Resuming such an activity never creates a window, so stop it first:
-    # the launch below then creates a fresh Android/WSLg window.
-    try {
-        $null = Invoke-Wsl ((Get-WslBase) + @('--', 'adb', '-s', $script:adbSerial, 'shell', 'am', 'force-stop', $app.Package)) 8000
-    } catch { }
-    Start-Sleep -Milliseconds 350
 
     $displayName = Get-AppDisplayName $app
     $loaderTitle.Text = "Запуск: $displayName"
@@ -3810,22 +4011,22 @@ function Start-AppLaunch($app) {
     }
     $loader.Show()
     $loaderBar.IsIndeterminate = $true
-    $launchTimer.Start()
-    Set-Footer ("Запуск $displayName…" + $compatNote)
 
     $cmd = "export DISPLAY=:0 WAYLAND_DISPLAY=wayland-0 XDG_RUNTIME_DIR=/run/user/`$(id -u); waydroid app launch $($app.Package)"
     $script:launchState.LaunchCmd = $cmd
+    $script:launchPrepStart = Get-Date
     try {
-        # waydroid app launch returns as soon as the request is accepted;
-        # a bounded call is more reliable than a detached wsl.exe process.
-        $null = Invoke-Wsl ((Get-WslBase) + @('--', 'bash', '-lc', $cmd)) 15000
-        Write-WinoidLog "launch sent: $($app.Package)"
+        # Wake, display mode, force-stop and the launch itself run in a job.
+        # The timer below wraps the window as soon as Android creates it.
+        $script:launchPrepJob = Start-AndroidLaunchJob $app.Package $sizeArg $densityArg $cmd
+        $launchTimer.Start()
+        Set-Footer ("Запуск $displayName…" + $compatNote)
     } catch {
-        Write-WinoidLog ("ERROR launch " + $app.Package + ": " + $_.Exception.ToString())
+        Write-WinoidLog ("ERROR launch job " + $app.Package + ": " + $_.Exception.ToString())
         $launchTimer.Stop()
         $script:launchState = $null
         $loader.Hide()
-        Set-Footer "Не удалось отправить запуск в Android: $($_.Exception.Message)"
+        Set-Footer "Не удалось запустить приложение: $($_.Exception.Message)"
     }
 }
 
@@ -4761,6 +4962,11 @@ $window.Add_Closing({
         if ($script:adb) { try { $script:adb.Dispose() } catch { }; $script:adb = $null }
     }
     Invoke-Safe 'closing.jobs' {
+        $pendingPkg = ''
+        if ($null -ne $script:launchState -and -not $script:launchState.Wrapped) {
+            $pendingPkg = [string]$script:launchState.App.Package
+        }
+        Stop-LaunchJobs -ForceStopPackage $pendingPkg
         if ($script:installJob) { Remove-Job -Job $script:installJob -Force -ErrorAction SilentlyContinue }
         if ($script:sessionJob) { Remove-Job -Job $script:sessionJob -Force -ErrorAction SilentlyContinue }
         if ($script:iconJob) {
