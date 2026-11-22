@@ -64,6 +64,7 @@ Assert-True ($text.Contains('Start-AndroidLaunchJob $app.Package')) 'app launch 
 Assert-True ($text.Contains('Complete-LaunchPrepJob')) 'launch job is collected by the timer'
 Assert-True ($text.Contains('$st.Prepared')) 'window is wrapped only after the final launch command'
 Assert-True ($text.Contains('Stop-LaunchJobs')) 'launch jobs are stopped on close or a new launch'
+Assert-True ($text.Contains('Fire-and-forget Android input')) 'adb input is queued on a background thread'
 Assert-True ($text.Contains('ARM compatibility is synchronized by the background launch job')) 'ARM compatibility runs with the background launch job'
 $iconJobSrc = Get-Content -LiteralPath (Join-Path $root 'assets\iconjob.ps1') -Raw
 Assert-True ($iconJobSrc -match '\[string\]\$Lnk') 'icon worker works without a desktop shortcut'

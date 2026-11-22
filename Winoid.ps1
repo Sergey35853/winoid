@@ -350,6 +350,15 @@ public class FrameGrabber : IDisposable {
 public class AdbShell : IDisposable {
     Process _p;
     BlockingCollection<string> _lines = new BlockingCollection<string>();
+    // Fire-and-forget Android input (taps, drags, key events) is queued and
+    // written by a dedicated background thread. Writing on the caller thread
+    // (the WPF dispatcher for a tap) can stall the whole window when the adb
+    // shell is busy - that freeze is what made a game hang right after its
+    // "Start" tap.
+    private readonly BlockingCollection<string> _sendQueue = new BlockingCollection<string>(new System.Collections.Concurrent.ConcurrentQueue<string>());
+    private readonly object _sendLock = new object();
+    private readonly System.Threading.Thread _sendThread;
+    private volatile bool _sendStopping;
 
     public AdbShell(string adb, string serial) : this(adb, serial, new string[0]) { }
 
@@ -369,21 +378,42 @@ public class AdbShell : IDisposable {
         _p.ErrorDataReceived += (s, e) => { if (e.Data != null) { try { _lines.Add(e.Data); } catch { } } };
         _p.BeginOutputReadLine();
         _p.BeginErrorReadLine();
+        _sendThread = new System.Threading.Thread(() => SendLoop());
+        _sendThread.IsBackground = true;
+        _sendThread.Start();
+    }
+
+    private void SendLoop() {
+        while (!this._sendStopping) {
+            string cmd = null;
+            bool got = false;
+            try { got = this._sendQueue.TryTake(out cmd, 250); } catch { break; }
+            if (!got) { continue; }
+            lock (this._sendLock) {
+                if (this._p == null || this._p.HasExited) { break; }
+                this._p.StandardInput.Write(cmd + "\n");
+                this._p.StandardInput.Flush();
+            }
+        }
     }
 
     public bool Running { get { return _p != null && !_p.HasExited; } }
 
+    // Fire-and-forget input (taps, drags, key events, am force-stop) is handed
+    // to the background writer thread so the WPF dispatcher never blocks on
+    // the adb shell.
     public void Send(string cmd) {
         if (!Running) throw new InvalidOperationException("adb shell is not running");
-        _p.StandardInput.Write(cmd + "\n");
-        _p.StandardInput.Flush();
+        this._sendQueue.Add(cmd);
     }
 
     public long SendSync(string cmd, int timeoutMs) {
         string marker = "M" + Guid.NewGuid().ToString("N");
         var sw = Stopwatch.StartNew();
-        _p.StandardInput.Write(cmd + "; echo " + marker + "\n");
-        _p.StandardInput.Flush();
+        lock (this._sendLock) {
+            this._p.StandardInput.Write(cmd + "; echo " + marker + "\n");
+            this._p.StandardInput.Flush();
+        }
         string line;
         while (sw.ElapsedMilliseconds < timeoutMs) {
             if (_lines.TryTake(out line, 25)) {
@@ -400,8 +430,10 @@ public class AdbShell : IDisposable {
         if (!Running) throw new InvalidOperationException("adb shell is not running");
         string marker = "Q" + Guid.NewGuid().ToString("N");
         StringBuilder sb = new StringBuilder();
-        _p.StandardInput.Write(cmd + "; echo " + marker + "\n");
-        _p.StandardInput.Flush();
+        lock (this._sendLock) {
+            this._p.StandardInput.Write(cmd + "; echo " + marker + "\n");
+            this._p.StandardInput.Flush();
+        }
         var sw = Stopwatch.StartNew();
         string line;
         while (sw.ElapsedMilliseconds < timeoutMs) {
@@ -414,6 +446,9 @@ public class AdbShell : IDisposable {
     }
 
     public void Dispose() {
+        this._sendStopping = true;
+        try { this._sendThread.Join(3000); } catch { }
+        try { _sendQueue.Dispose(); } catch { }
         try { _p.StandardInput.WriteLine("exit"); _p.StandardInput.Flush(); } catch { }
         try { if (!_p.WaitForExit(400)) _p.Kill(); } catch { }
     }
@@ -521,7 +556,7 @@ function Initialize-WinoidData {
 # Optional config: %LOCALAPPDATA%\Winoid\config.json
 # { "wslDistro": "Winoid", "adbSerial": "192.168.240.112:5555" }
 $script:dataRoot = Initialize-WinoidData
-$script:appVersion = '0.1.41'
+$script:appVersion = '0.1.42'
 $script:iconQueue = New-Object System.Collections.Queue
 $script:geometryPath = Join-Path $script:dataRoot 'geometry.json'
 $script:appGeometry = @{}
@@ -2315,6 +2350,9 @@ function Send-Android([string]$cmd) {
         Initialize-Adb
     }
     if ($null -eq $script:adb -or -not $script:adb.Running) { return }
+    # Fire-and-forget input is handed to the adb shell's background writer, so
+    # the WPF dispatcher never blocks on a busy or wedged adb shell (that is
+    # what froze games right after a "Start" tap).
     try { $script:adb.Send($cmd) } catch { }
 }
 
