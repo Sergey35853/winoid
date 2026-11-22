@@ -1,6 +1,6 @@
 #define MyAppName "Winoid"
 #ifndef MyAppVersion
-  #define MyAppVersion "0.1.50"
+  #define MyAppVersion "0.1.52"
 #endif
 #define MyAppPublisher "Sergey35853"
 #define MyAppURL "https://github.com/Sergey35853/winoid"
@@ -50,6 +50,7 @@ Source: "..\config.example.json"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\assets\android.ico"; DestDir: "{app}\assets"; Flags: ignoreversion
 Source: "..\assets\winoid-icon.dex"; DestDir: "{app}\assets"; Flags: ignoreversion
 Source: "..\assets\iconjob.ps1"; DestDir: "{app}\assets"; Flags: ignoreversion
+Source: "..\assets\installjob.ps1"; DestDir: "{app}\assets"; Flags: ignoreversion
 Source: "..\docs\screenshot-manager.png"; DestDir: "{app}\docs"; Flags: ignoreversion
 Source: "Setup-ADB.ps1"; DestDir: "{app}\installer"; Flags: ignoreversion
 

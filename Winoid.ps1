@@ -464,6 +464,7 @@ $script:launchRetryJob = $null
 $script:launchPrepStart = [DateTime]::MinValue
 $script:pendingAndroidWindow = $null
 $script:installJob = $null
+$script:installStagePath = ''
 $script:installTicks = 0
 $script:sessionJob = $null
 $script:sessionTicks = 0
@@ -564,7 +565,7 @@ function Initialize-WinoidData {
 # Optional config: %LOCALAPPDATA%\Winoid\config.json
 # { "wslDistro": "Winoid", "adbSerial": "192.168.240.112:5555" }
 $script:dataRoot = Initialize-WinoidData
-$script:appVersion = '0.1.50'
+$script:appVersion = '0.1.52'
 $script:iconQueue = New-Object System.Collections.Queue
 $script:geometryPath = Join-Path $script:dataRoot 'geometry.json'
 $script:appGeometry = @{}
@@ -4185,14 +4186,19 @@ $installTimer.Add_Tick({
     $script:installTicks++
     $sec = $script:installTicks
     if ($sec -lt 60) { $loaderElapsed.Text = "$sec сек" } else { $loaderElapsed.Text = ('{0}:{1:00}' -f [int]($sec / 60), ($sec % 60)) }
-    $state = 'Unknown'
-    try { $state = [string]$script:installJob.State } catch { }
-    if ($state -in @('Completed', 'Failed', 'Stopped')) {
+    $exited = $false
+    try { $exited = [bool]$script:installJob.HasExited } catch { $exited = $true }
+    if ($exited) {
         $out = ''
-        try { $out = @(Receive-Job -Job $script:installJob -ErrorAction SilentlyContinue) | Out-String } catch { }
-        Write-WinoidLog "install job $state`: $out"
-        Remove-Job -Job $script:installJob -Force -ErrorAction SilentlyContinue
+        $jobLogPath = Join-Path $script:dataRoot 'install.log'
+        try { $out = [System.IO.File]::ReadAllText($jobLogPath) } catch { }
+        Write-WinoidLog "install job exited: $(($out -split "`r?`n" | Select-Object -Last 2) -join ' ')"
+        try { $script:installJob.Dispose() } catch { }
         $script:installJob = $null
+        if ($script:installStagePath) {
+            Remove-Item -LiteralPath $script:installStagePath -Force -ErrorAction SilentlyContinue
+            $script:installStagePath = ''
+        }
         $installTimer.Stop()
         $loader.Hide()
         Invoke-Safe 'install.refresh' { Refresh-Apps }
@@ -4207,13 +4213,13 @@ $installTimer.Add_Tick({
 function Install-Apk([string]$path) {
     if ([string]::IsNullOrWhiteSpace($path) -or -not (Test-Path -LiteralPath $path)) { return }
     if ($null -ne $script:installJob) {
-        $state = 'Unknown'
-        try { $state = [string]$script:installJob.State } catch { }
-        if ($state -notin @('Completed', 'Failed', 'Stopped')) {
+        $busy = $false
+        try { $busy = -not [bool]$script:installJob.HasExited } catch { }
+        if ($busy) {
             Set-Footer 'Установка уже идёт. Дождитесь её окончания.'
             return
         }
-        Remove-Job -Job $script:installJob -Force -ErrorAction SilentlyContinue
+        try { $script:installJob.Dispose() } catch { }
         $script:installJob = $null
     }
     if ($null -ne $script:sessionJob -and $sessionTimer.IsEnabled) {
@@ -4222,22 +4228,34 @@ function Install-Apk([string]$path) {
     }
 
     $apk = (Resolve-Path -LiteralPath $path).Path
+    # wsl.exe mangles non-ASCII argument paths (the user's APK folder is in
+    # Russian), so stage the file under an ASCII path before handing it over.
+    $stageDir = Join-Path $script:dataRoot 'staged'
+    if (-not (Test-Path -LiteralPath $stageDir)) { New-Item -ItemType Directory -Path $stageDir -Force | Out-Null }
+    $script:installStagePath = Join-Path $stageDir ('install-' + [guid]::NewGuid().ToString('N') + '.apk')
+    try { Copy-Item -LiteralPath $apk -Destination $script:installStagePath -Force } catch {
+        Set-Footer 'Не удалось скопировать APK. Попробуйте другой-path.'
+        $script:installStagePath = ''
+        return
+    }
     Invoke-Safe 'install.initAdb' { Initialize-Adb }
 
     # Prefer WSL adb for the same reason as input: the Windows route to the
     # Waydroid subnet may be blackholed by a VPN. Windows adb is the fallback.
     $mode = ''
     $exe = ''
-    $apkArg = $apk
+    $apkArg = $script:installStagePath
     if ($script:adbViaWsl -and $null -ne $script:adb -and $script:adb.Running) {
         $mode = 'wsl'
         $exe = $script:wsl
-        $apkArg = ConvertTo-WslPath $apk
+        $apkArg = ConvertTo-WslPath $script:installStagePath
     } elseif (-not [string]::IsNullOrWhiteSpace($script:adbPath)) {
         $mode = 'local'
         $exe = $script:adbPath
     } else {
         Set-Footer 'ADB не найден. Установите platform-tools или настройте Android заново.'
+        Remove-Item -LiteralPath $script:installStagePath -Force -ErrorAction SilentlyContinue
+        $script:installStagePath = ''
         return
     }
     Write-WinoidLog "install start ($mode): $apk"
@@ -4254,39 +4272,27 @@ function Install-Apk([string]$path) {
     $jobDistro = $script:wslDistro
     $jobSerial = $script:adbSerial
     $jobLog = Join-Path $script:dataRoot 'install.log'
+    $jobAdb = $script:adbPath
+    $worker = Join-Path $script:baseDir 'assets\installjob.ps1'
     try {
-        $script:installJob = Start-Job -ScriptBlock {
-            param($mode, $exe, $distro, $serial, $apkPath, $logFile)
-            $lines = New-Object System.Collections.ArrayList
-            [void]$lines.Add("mode=$mode")
-            # A freshly restarted Waydroid session can refuse the first
-            # install (adb returns -1 while the daemon is still coming up).
-            # Retry once before reporting failure.
-            $wslArgs = @()
-            if (-not [string]::IsNullOrWhiteSpace($distro)) { $wslArgs += @('-d', $distro) }
-            for ($attempt = 1; $attempt -le 2; $attempt++) {
-                if ($mode -eq 'wsl') {
-                    $out = & $exe @wslArgs -- adb -s $serial install -r $apkPath 2>&1
-                } else {
-                    $out = & $exe -s $serial install -r $apkPath 2>&1
-                }
-                $code = $LASTEXITCODE
-                if ($code -eq 0) { break }
-                Start-Sleep -Seconds 3
-            }
-            foreach ($l in @($out)) { [void]$lines.Add([string]$l) }
-            [void]$lines.Add("install exit=$code")
-            try {
-                $dir = Split-Path -Parent $logFile
-                if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-                [System.IO.File]::WriteAllText($logFile, (($lines -join "`r`n") + "`r`nWINOID_INSTALL_EXIT=$code"), (New-Object System.Text.UTF8Encoding($false)))
-            } catch { }
-            foreach ($l in $lines) { $l }
-            "WINOID_INSTALL_EXIT=$code"
-        } -ArgumentList $mode, $jobExe, $jobDistro, $jobSerial, $apkArg, $jobLog
+        $args = @(
+            '-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', $worker,
+            '-Mode', $mode,
+            '-WslExe', $jobExe,
+            '-Distro', $jobDistro,
+            '-AdbExe', $jobAdb,
+            '-Serial', $jobSerial,
+            '-ApkPath', $apkArg,
+            '-LogFile', $jobLog
+        )
+        $quoted = @($args | ForEach-Object { '"' + ([string]$_) + '"' })
+        $script:installJob = Start-Process -FilePath 'pwsh.exe' -ArgumentList $quoted -WindowStyle Hidden -PassThru
     } catch {
-        Write-WinoidLog ("ERROR install job: " + $_.Exception.ToString())
         $script:installJob = $null
+        if ($script:installStagePath) {
+            Remove-Item -LiteralPath $script:installStagePath -Force -ErrorAction SilentlyContinue
+            $script:installStagePath = ''
+        }
         $loader.Hide()
         Set-Footer "Не удалось запустить установку: $($_.Exception.Message)"
         return
@@ -5121,7 +5127,8 @@ $window.Add_Closing({
             $pendingPkg = [string]$script:launchState.App.Package
         }
         Stop-LaunchJobs -ForceStopPackage $pendingPkg
-        if ($script:installJob) { Remove-Job -Job $script:installJob -Force -ErrorAction SilentlyContinue }
+        if ($script:installJob) { try { $script:installJob.Kill($true) } catch { }; try { $script:installJob.Dispose() } catch { } }
+        if ($script:installStagePath) { try { Remove-Item -LiteralPath $script:installStagePath -Force -ErrorAction SilentlyContinue } catch { } }
         if ($script:sessionJob) { Remove-Job -Job $script:sessionJob -Force -ErrorAction SilentlyContinue }
         if ($script:iconJob) {
             try { $script:iconJob.Kill($true) } catch { try { $script:iconJob.Kill() } catch { } }
