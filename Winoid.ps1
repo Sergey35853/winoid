@@ -556,7 +556,7 @@ function Initialize-WinoidData {
 # Optional config: %LOCALAPPDATA%\Winoid\config.json
 # { "wslDistro": "Winoid", "adbSerial": "192.168.240.112:5555" }
 $script:dataRoot = Initialize-WinoidData
-$script:appVersion = '0.1.42'
+$script:appVersion = '0.1.43'
 $script:iconQueue = New-Object System.Collections.Queue
 $script:geometryPath = Join-Path $script:dataRoot 'geometry.json'
 $script:appGeometry = @{}
@@ -2883,7 +2883,7 @@ function Focus-Wrapper($w) {
     } catch { }
 }
 
-function New-AppWrapper($app, [IntPtr]$source, $size) {
+function New-AppWrapper($app, [IntPtr]$source, $size, $frames = $null) {
     foreach ($old in @($script:wrappers)) {
         if (-not $old.Closed -and $old.Source -eq $source) { Focus-Wrapper $old; return $old }
     }
@@ -2898,7 +2898,10 @@ function New-AppWrapper($app, [IntPtr]$source, $size) {
     # ADB input is display-wide, while the captured panes start at their
     # Android freeform frame. Record each pane's frame origin so taps are
     # translated to the right place instead of the top-left of Android.
-    $androidFrames = @(Get-AndroidWindowFrames $app.Package)
+    # Prefer the frames collected by the launch job: on a cold start dumpsys
+    # can still be empty when the WSLg window first appears.
+    if ($null -ne $frames) { $androidFrames = @($frames) }
+    else { $androidFrames = @(Get-AndroidWindowFrames $app.Package) }
     Set-PaneAndroidFrames $panes $androidFrames
     # Settings is one Android window whose height is the freeform frame, not
     # the WSLg shadowed surface. Use the frame size for the wrapper so the
@@ -3583,10 +3586,11 @@ $script:frameTimer.Add_Tick({
                     try { $late = @([NativeWin]::ListWindows([uint32]$proc.Id)) } catch { }
                     foreach ($wnd in $late) {
                         if ($null -eq $wnd -or -not $wnd.Visible) { continue }
-                        # Only park a full-size copy of the app window (the one
-                        # carrying the gray caption). Small sub-surfaces belong
-                        # to the game's own rendering and must stay untouched.
-                        if ($wnd.Title -match 'sub-surface') { continue }
+                        # Settings follows its own sub-surfaces as panes, so
+                        # leave them alone. For games a full-size sub-surface
+                        # is a duplicate left on the desktop; the size check
+                        # below keeps small in-game surfaces untouched.
+                        if ($w.Package -eq 'com.android.settings' -and $wnd.Title -match 'sub-surface') { continue }
                         if ($wnd.Width -lt [int]($w.SrcW * 0.7) -or $wnd.Height -lt [int]($w.SrcH * 0.7)) { continue }
                         if ($known.Contains($wnd.Hwnd)) { continue }
                         if ([NativeWin]::GetAncestor($wnd.Hwnd, 3) -ne $rootOwner) { continue }
@@ -3684,6 +3688,21 @@ $script:launchWorker = {
     }
     $base = @(); if (-not [string]::IsNullOrWhiteSpace($distro)) { $base = @('-d', $distro) }
     $root = @('-u', 'root')
+    $defaultLaunchCmd = $launchCmd
+
+    # 'waydroid app launch' sometimes fails to resolve a game's launcher
+    # activity and silently leaves Android on the home screen. Resolving the
+    # activity with adb and starting it explicitly works reliably.
+    function Get-LaunchCommand {
+        $r = Invoke-W ($base + @('--', 'adb', '-s', $serial, 'shell', 'cmd', 'package', 'resolve-activity', '--brief', $pkg)) 12000
+        if ($r.Code -eq 0) {
+            foreach ($line in ([string]$r.Out -split "`r?`n")) {
+                $t = $line.Trim()
+                if ($t -match '^[\w\.]+/[\w\.\$]+$') { return "adb -s $serial shell am start -n $t" }
+            }
+        }
+        return $defaultLaunchCmd
+    }
 
     if ($mode -eq 'retry') {
         $null = Invoke-W ($base + @('--', 'bash', '-lc', 'systemctl --user restart waydroid-session.service')) 30000
@@ -3693,7 +3712,8 @@ $script:launchWorker = {
             if ($s.Out -match '(?m)^Container:\s*RUNNING') { break }
         }
         Start-Sleep -Seconds 6
-        $null = Invoke-W ($base + @('--', 'bash', '-lc', $launchCmd)) 15000
+        $useCmd = Get-LaunchCommand
+        $null = Invoke-W ($base + @('--', 'bash', '-lc', $useCmd)) 15000
         [pscustomobject]@{ Ok = $true; Stage = 'retry'; Message = '' }
         return
     }
@@ -3752,8 +3772,33 @@ $script:launchWorker = {
     # A stale activity with no WSLg surface never creates a new window.
     $null = Invoke-W ($base + @('--', 'adb', '-s', $serial, 'shell', 'am', 'force-stop', $pkg)) 8000
     Start-Sleep -Milliseconds 350
-    $r = Invoke-W ($base + @('--', 'bash', '-lc', $launchCmd)) 15000
-    [pscustomobject]@{ Ok = $true; Stage = 'launched'; Code = $r.Code; Message = (($r.Out + ' ' + $r.Err).Trim()); CompatApplied = $armAppliedNow }
+    $useCmd = Get-LaunchCommand
+    $r = Invoke-W ($base + @('--', 'bash', '-lc', $useCmd)) 15000
+
+    # The wrapper needs the Android freeform frame origin to translate taps.
+    # On a cold launch the window can appear before 'dumpsys window windows'
+    # knows its frame; wrapping at that moment makes every tap land near 0,0
+    # and the game's Start button never reacts. Wait for the frame here (in the
+    # background job) instead of blocking the manager window.
+    $frames = @()
+    for ($i = 0; $i -lt 20; $i++) {
+        Start-Sleep -Milliseconds 500
+        $fw = Invoke-W ($base + @('--', 'adb', '-s', $serial, 'shell', 'dumpsys', 'window', 'windows')) 9000
+        if ($fw.Code -ne 0) { continue }
+        $frames = @()
+        foreach ($block in [regex]::Split([string]$fw.Out, '(?m)^\s*Window #')) {
+            if ($block -notmatch 'u\d+\s+([^\s/]+)/') { continue }
+            if ($matches[1] -ne $pkg) { continue }
+            $fm = [regex]::Match($block, 'frame=\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]')
+            if (-not $fm.Success) { continue }
+            $l = [int]$fm.Groups[1].Value; $t = [int]$fm.Groups[2].Value
+            $rr = [int]$fm.Groups[3].Value; $b = [int]$fm.Groups[4].Value
+            if ($rr -le $l -or $b -le $t) { continue }
+            $frames += [pscustomobject]@{ L = $l; T = $t; W = ($rr - $l); H = ($b - $t) }
+        }
+        if ($frames.Count -gt 0) { break }
+    }
+    [pscustomobject]@{ Ok = $true; Stage = 'launched'; Code = $r.Code; Message = (($r.Out + ' ' + $r.Err).Trim()); CompatApplied = $armAppliedNow; Frames = $frames }
 }
 
 function Start-AndroidLaunchJob([string]$package, [string]$sizeArg, [string]$densityArg, [string]$launchCmd) {
@@ -3826,6 +3871,11 @@ function Complete-LaunchPrepJob {
     $script:launchState.Prepared = $true
     Write-WinoidLog "launch sent: $pkg (size=$($script:launchState.SizeArg) density=$($script:launchState.DensityArg))"
     $script:armCompatApplied = [bool]$result.CompatApplied
+    $frProp = $result.PSObject.Properties['Frames']
+    if ($null -ne $frProp) {
+        $script:launchState.Frames = @($frProp.Value)
+        Write-WinoidLog "launch frames for $pkg : $($script:launchState.Frames.Count)"
+    }
 }
 
 function Complete-LaunchRetryJob {
@@ -3885,7 +3935,9 @@ $launchTimer.Add_Tick({
                 }
                 $st.SeekTicks++
                 if ($ready) {
-                    $w = New-AppWrapper $st.App $h $st.Size
+                    $stFrames = $null
+                    if ($st.PSObject.Properties['Frames']) { $stFrames = $st.Frames }
+                    $w = New-AppWrapper $st.App $h $st.Size $stFrames
                     if ($null -ne $w) {
                         $st.Wrapped = $true
                         Set-Footer "Окно «$(Get-AppDisplayName $st.App)» открыто."
@@ -4017,6 +4069,7 @@ function Start-AppLaunch($app) {
         Prepared = $false
         Retried = $false
         LaunchCmd = ''
+        Frames = @()
         Size = $sizeChoice
         SizeArg = $sizeArg
         DensityArg = $densityArg

@@ -65,6 +65,10 @@ Assert-True ($text.Contains('Complete-LaunchPrepJob')) 'launch job is collected 
 Assert-True ($text.Contains('$st.Prepared')) 'window is wrapped only after the final launch command'
 Assert-True ($text.Contains('Stop-LaunchJobs')) 'launch jobs are stopped on close or a new launch'
 Assert-True ($text.Contains('Fire-and-forget Android input')) 'adb input is queued on a background thread'
+Assert-True ($text.Contains('Get-LaunchCommand')) 'launch uses an explicitly resolved Android activity'
+Assert-True ($text.Contains('launch frames for $pkg')) 'launch job collects Android window frames for tap mapping'
+Assert-True ($text.Contains('New-AppWrapper $st.App $h $st.Size $stFrames')) 'wrapper uses frames collected by the launch job'
+Assert-True ($text.Contains('full-size sub-surface')) 'duplicate full-size game surfaces are parked instead of left on the desktop'
 Assert-True ($text.Contains('ARM compatibility is synchronized by the background launch job')) 'ARM compatibility runs with the background launch job'
 $iconJobSrc = Get-Content -LiteralPath (Join-Path $root 'assets\iconjob.ps1') -Raw
 Assert-True ($iconJobSrc -match '\[string\]\$Lnk') 'icon worker works without a desktop shortcut'
