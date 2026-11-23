@@ -466,6 +466,7 @@ $script:pendingAndroidWindow = $null
 $script:installJob = $null
 $script:installStagePath = ''
 $script:installTicks = 0
+$script:installStartAt = [DateTime]::MinValue
 $script:sessionJob = $null
 $script:sessionTicks = 0
 $script:sessionWaiting = $false
@@ -565,7 +566,7 @@ function Initialize-WinoidData {
 # Optional config: %LOCALAPPDATA%\Winoid\config.json
 # { "wslDistro": "Winoid", "adbSerial": "192.168.240.112:5555" }
 $script:dataRoot = Initialize-WinoidData
-$script:appVersion = '0.1.52'
+$script:appVersion = '0.1.53'
 $script:iconQueue = New-Object System.Collections.Queue
 $script:geometryPath = Join-Path $script:dataRoot 'geometry.json'
 $script:appGeometry = @{}
@@ -600,6 +601,16 @@ if (Test-Path -LiteralPath $script:configPath) {
 }
 if ($env:WINOID_WSL_DISTRO) { $script:wslDistro = $env:WINOID_WSL_DISTRO }
 if ($env:WINOID_ADB_SERIAL) { $script:adbSerial = $env:WINOID_ADB_SERIAL }
+
+# A manager killed in the middle of an install leaves its staged APK behind.
+# There is only one manager at a time, so anything here at startup is stale.
+try {
+    $staleStaged = Join-Path $script:dataRoot 'staged'
+    if (Test-Path -LiteralPath $staleStaged) {
+        Get-ChildItem -LiteralPath $staleStaged -Filter 'install-*.apk' -File -ErrorAction SilentlyContinue |
+            Remove-Item -Force -ErrorAction SilentlyContinue
+    }
+} catch { }
 
 # Android profiles: named sets of WSL distro / adb serial.
 $script:profilesPath = Join-Path $script:dataRoot 'profiles.json'
@@ -1497,7 +1508,11 @@ function Invoke-Wsl {
     $outTask = $p.StandardOutput.ReadToEndAsync()
     $errTask = $p.StandardError.ReadToEndAsync()
     if (-not $p.WaitForExit($TimeoutMs)) {
-        try { $p.Kill() } catch { }
+        # Kill the whole tree: a plain Kill() leaves the Linux-side wsl.exe
+        # child alive, and those orphans keep pipes open and pile up until
+        # WSL stops responding.
+        try { $p.Kill($true) } catch { try { $p.Kill() } catch { } }
+        try { [void]$p.WaitForExit(2000) } catch { }
         return [pscustomobject]@{ Out = ''; Err = 'timeout'; Code = -1 }
     }
     return [pscustomobject]@{ Out = $outTask.Result; Err = $errTask.Result; Code = $p.ExitCode }
@@ -2279,7 +2294,7 @@ function Find-AdbExe {
 }
 
 function Invoke-AdbCli {
-    param([string[]]$Arguments, [int]$TimeoutMs = 6000)
+    param([string[]]$Arguments, [int]$TimeoutMs = 6000, [switch]$Raw)
     if (-not $script:adbPath) { return $null }
     $psi = [System.Diagnostics.ProcessStartInfo]::new()
     $psi.FileName = $script:adbPath
@@ -2298,6 +2313,11 @@ function Invoke-AdbCli {
     # Never touch Result on a process that survived Kill: adb connect can
     # hang on a VPN-blackholed route and would freeze the UI thread.
     if (-not $p.HasExited) { return '' }
+    if ($Raw) {
+        # Line-oriented callers (dumpsys parsing) must keep the original
+        # newlines; collapsing whitespace turns the whole dump into one line.
+        return ($outTask.Result + "`n" + $errTask.Result)
+    }
     return (($outTask.Result + ' ' + $errTask.Result) -replace '\s+', ' ').Trim()
 }
 
@@ -2570,7 +2590,7 @@ function Get-AndroidWindowFrames([string]$package) {
         }
     } catch { }
     if ([string]::IsNullOrWhiteSpace($text) -and $script:adbPath) {
-        try { $text = [string](Invoke-AdbCli @('-s', $script:adbSerial, 'shell', 'dumpsys', 'window', 'windows') 9000) } catch { }
+        try { $text = [string](Invoke-AdbCli -Arguments @('-s', $script:adbSerial, 'shell', 'dumpsys', 'window', 'windows') -TimeoutMs 9000 -Raw) } catch { }
     }
     if ([string]::IsNullOrWhiteSpace($text)) { return @() }
 
@@ -2610,10 +2630,11 @@ function Set-PaneAndroidFrames($panes, $frames) {
 
         $dw = $pw - [int]$best.W; $dh = $ph - [int]$best.H
         $ax = [int]$best.L; $ay = [int]$best.T
+        # A pane WIDER than the Android frame carries the WSLg shadow, which
+        # is centred around the content: move the origin back by half of it.
+        # A pane NARROWER than the frame is a clipped surface, not a window
+        # with margins, so $ax stays at the frame origin.
         if ($dw -gt 0) { $ax -= [int][math]::Round($dw / 2) }
-        # A pane NARROWER than the Android frame is a clipped WSLg surface,
-        # not a window with margins: keep the frame origin instead of shifting
-        # every tap to the right.
         if ($dh -gt 0) { $ay -= [int][math]::Round($dh / 2) }
         elseif ($dh -lt 0) { $ay += -$dh }
 
@@ -2928,6 +2949,15 @@ function New-AppWrapper($app, [IntPtr]$source, $size, $frames = $null) {
             if ($d -lt $fitDelta) { $fit = $f; $fitDelta = $d }
         }
         if ($null -ne $fit -and ([int]$p0.W -lt [int]$fit.W - 8 -or [int]$p0.H -lt [int]$fit.H - 8)) {
+            # A maximized surface ignores SetWindowPos, so restore it first;
+            # otherwise the resize silently does nothing and the picture stays
+            # clipped while the client rect reports the screen size.
+            if ([NativeWin]::IsZoomed($p0.Source)) {
+                [void][NativeWin]::ShowWindow($p0.Source, 9)
+                for ($z = 0; $z -lt 20 -and [NativeWin]::IsZoomed($p0.Source); $z++) {
+                    [System.Threading.Thread]::Sleep(25)
+                }
+            }
             [void][NativeWin]::SetWindowPos($p0.Source, [IntPtr]::Zero, 0, 0,
                 [int]$fit.W + 24, [int]$fit.H + 24, 0x0006)
             [System.Threading.Thread]::Sleep(350)
@@ -2936,6 +2966,9 @@ function New-AppWrapper($app, [IntPtr]$source, $size, $frames = $null) {
             if ($grown.Right -ge [int]$fit.W) { $p0.W = [int]$grown.Right }
             if ($grown.Bottom -ge [int]$fit.H) { $p0.H = [int]$grown.Bottom }
             Set-PaneAndroidFrames $panes $androidFrames
+            if ([int]$p0.W -lt [int]$fit.W - 8) {
+                try { Write-WinoidLog "surface still narrow: $($p0.W) < $($fit.W) ($($app.Package))" } catch { }
+            }
         }
     }
     # Settings is one Android window whose height is the freeform frame, not
@@ -3755,7 +3788,35 @@ $script:launchWorker = {
         return $defaultLaunchCmd
     }
 
-    if ($mode -eq 'retry') {
+    # WSLg 1.0.73 (WSL 2.7) loses its shared-memory surface after a VM
+    # restart: every Linux window is created invisible ("[WARN:COPY MODE]")
+    # even though the app runs. Restarting weston inside the WSLg system
+    # distro rebuilds the surface pipeline and the next window is real.
+    # This is the documented upstream workaround, not a Winoid bug.
+    function Get-WslgSurfaceState {
+        $r = Invoke-W ($base + @('--', 'bash', '-lc', "grep 'use_gfxredir' /mnt/wslg/weston.log 2>/dev/null | tail -1")) 8000
+        if ($r.Out -match 'use_gfxredir\s*=\s*(\d)') { return [int]$matches[1] }
+        return 1
+    }
+    function Repair-WslgSurface {
+        $kill = Invoke-W (@('--system', '-u', 'root', '--', 'sh', '-c', 'pkill -x weston') ) 8000
+        if ($kill.Code -ne 0) { return $false }
+        # WSLGd brings weston back on its own; wait for the new compositor so
+        # the app surface is created against a healthy one.
+        for ($i = 0; $i -lt 40; $i++) {
+            Start-Sleep -Milliseconds 300
+            $r = Invoke-W (@('--system', '-u', 'root', '--', 'pgrep', '-x', 'weston')) 5000
+            if ($r.Code -eq 0) { Start-Sleep -Seconds 2; return $true }
+        }
+        return $false
+    }
+    function Sync-WslgSurface {
+        $state = Get-WslgSurfaceState
+        if ($state -ne 0) { return $state }
+        $null = Repair-WslgSurface
+        return Get-WslgSurfaceState
+    }
+    function Restart-WaydroidSession {
         $null = Invoke-W ($base + @('--', 'bash', '-lc', 'systemctl --user restart waydroid-session.service')) 30000
         for ($i = 0; $i -lt 50; $i++) {
             Start-Sleep -Milliseconds 1000
@@ -3763,11 +3824,34 @@ $script:launchWorker = {
             if ($s.Out -match '(?m)^Container:\s*RUNNING') { break }
         }
         Start-Sleep -Seconds 6
+    }
+
+    # A plain 'am start' starts the activity inside Android but a fresh
+    # Waydroid session does not export a Wayland window for it; the desktop
+    # stays empty while dumpsys already reports the app in front. Launching
+    # through the session ('waydroid app launch') is what creates the window.
+    # The resolved 'am start' remains the fallback for activities the Waydroid
+    # launcher cannot resolve.
+    function Start-AppWindow {
+        $null = Invoke-W ($base + @('--', 'bash', '-lc', "waydroid app launch $pkg")) 20000
+        $needle = 'topResumedActivity=.*' + [regex]::Escape($pkg) + '/'
+        for ($i = 0; $i -lt 8; $i++) {
+            Start-Sleep -Milliseconds 700
+            $a = Invoke-W ($base + @('--', 'adb', '-s', $serial, 'shell', 'dumpsys', 'activity', 'activities')) 9000
+            if ([string]$a.Out -match $needle) { return 0 }
+        }
+        $useCmd = Get-LaunchCommand
+        $r = Invoke-W ($base + @('--', 'bash', '-lc', $useCmd)) 15000
+        return $r.Code
+    }
+
+    if ($mode -eq 'retry') {
+        $wslg = Sync-WslgSurface
+        Restart-WaydroidSession
         $null = Invoke-W ($base + @('--', 'adb', '-s', $serial, 'shell', 'wm', 'size', $sizeArg)) 10000
         $null = Invoke-W ($base + @('--', 'adb', '-s', $serial, 'shell', 'wm', 'density', $densityArg)) 10000
-        $useCmd = Get-LaunchCommand
-        $null = Invoke-W ($base + @('--', 'bash', '-lc', $useCmd)) 15000
-        [pscustomobject]@{ Ok = $true; Stage = 'retry'; Message = '' }
+        $null = Start-AppWindow
+        [pscustomobject]@{ Ok = $true; Stage = 'retry'; Message = "wslg=$wslg" }
         return
     }
 
@@ -3817,6 +3901,19 @@ $script:launchWorker = {
         return
     }
 
+    # A broken WSLg surface pipeline ("use_gfxredir = 0", windows titled
+    # "[WARN:COPY MODE]") makes every Linux window invisible while the app
+    # itself runs fine. Repair it before the launch so the first attempt
+    # already opens a real window instead of waiting 35 s for the retry.
+    $wslg = Get-WslgSurfaceState
+    if ($wslg -eq 0) {
+        $null = Repair-WslgSurface
+        # Killing weston drops the session's Wayland connection; restarting
+        # the session is what makes Waydroid paint into the new compositor.
+        Restart-WaydroidSession
+        $wslg = Get-WslgSurfaceState
+    }
+
     # Always send both: 'reset' restores the physical display, a concrete
     # value applies the mode picked in the manager.
     $null = Invoke-W ($base + @('--', 'adb', '-s', $serial, 'shell', 'wm', 'size', $sizeArg)) 10000
@@ -3825,8 +3922,7 @@ $script:launchWorker = {
     # A stale activity with no WSLg surface never creates a new window.
     $null = Invoke-W ($base + @('--', 'adb', '-s', $serial, 'shell', 'am', 'force-stop', $pkg)) 8000
     Start-Sleep -Milliseconds 350
-    $useCmd = Get-LaunchCommand
-    $r = Invoke-W ($base + @('--', 'bash', '-lc', $useCmd)) 15000
+    $r = [pscustomobject]@{ Code = (Start-AppWindow) }
 
     # The wrapper needs the Android freeform frame origin to translate taps.
     # On a cold launch the window can appear before 'dumpsys window windows'
@@ -3851,7 +3947,7 @@ $script:launchWorker = {
         }
         if ($frames.Count -gt 0) { break }
     }
-    [pscustomobject]@{ Ok = $true; Stage = 'launched'; Code = $r.Code; Message = (($r.Out + ' ' + $r.Err).Trim()); CompatApplied = $armAppliedNow; Frames = $frames }
+    [pscustomobject]@{ Ok = $true; Stage = 'launched'; Code = $r.Code; Message = (($r.Out + ' ' + $r.Err).Trim()); CompatApplied = $armAppliedNow; Frames = $frames; Wslg = $wslg }
 }
 
 function Start-AndroidLaunchJob([string]$package, [string]$sizeArg, [string]$densityArg, [string]$launchCmd) {
@@ -3892,13 +3988,17 @@ function Complete-LaunchPrepJob {
     if ($null -eq $script:launchPrepJob) { return }
     $state = 'Unknown'
     try { $state = [string]$script:launchPrepJob.State } catch { }
-    $timedOut = ((Get-Date) - $script:launchPrepStart).TotalSeconds -gt 75
+    # The job's own waits add up (unfreeze 21 s, display 20 s, force-stop 8 s,
+    # activity resolution 36 s, frame collection 10 s) and a WSLg repair adds
+    # a weston restart plus a session restart (~30 s).
+    $timedOut = ((Get-Date) - $script:launchPrepStart).TotalSeconds -gt 180
     if ($state -notin @('Completed', 'Failed', 'Stopped') -and -not $timedOut) { return }
 
     $result = $null
     if (-not $timedOut) {
         try { $result = @(Receive-Job -Job $script:launchPrepJob -ErrorAction SilentlyContinue) | Select-Object -Last 1 } catch { }
     }
+    if ($timedOut) { try { Stop-Job -Job $script:launchPrepJob -Force -ErrorAction SilentlyContinue } catch { } }
     try { Remove-Job -Job $script:launchPrepJob -Force -ErrorAction SilentlyContinue } catch { }
     $script:launchPrepJob = $null
     if ($null -eq $script:launchState) { return }
@@ -3907,7 +4007,7 @@ function Complete-LaunchPrepJob {
     if ($timedOut) {
         Write-WinoidLog "launch prep timed out: $pkg"
         $loader.Hide(); $launchTimer.Stop(); $script:launchState = $null
-        Set-Footer 'Android не ответил за 75 секунд. Попробуйте ещё раз.'
+        Set-Footer 'Android не ответил за 3 минуты. Попробуйте ещё раз.'
         return
     }
     if ($null -eq $result -or -not $result.Ok) {
@@ -3923,6 +4023,17 @@ function Complete-LaunchPrepJob {
     }
     $script:launchState.Prepared = $true
     Write-WinoidLog "launch sent: $pkg (size=$($script:launchState.SizeArg) density=$($script:launchState.DensityArg))"
+    if ($result.PSObject.Properties['Wslg']) {
+        $wslg = [int]$result.Wslg
+        Write-WinoidLog "wslg surface state: $wslg"
+        if ($wslg -eq 0) { Write-WinoidLog 'wslg still in copy mode; the window may stay invisible' }
+    }
+    if ($result.PSObject.Properties['Code'] -and [int]$result.Code -ne 0) {
+        # 'am start' can fail (activity not exported, package disabled) while
+        # the job still reports success; keep the reason in the log instead of
+        # waiting 35 s and restarting the whole session for nothing.
+        Write-WinoidLog "launch command failed: $pkg exit=$($result.Code) $($result.Message)"
+    }
     $script:armCompatApplied = [bool]$result.CompatApplied
     $frProp = $result.PSObject.Properties['Frames']
     if ($null -ne $frProp) {
@@ -3941,6 +4052,7 @@ function Complete-LaunchRetryJob {
     $script:launchRetryJob = $null
     # The retry restarted the session; the persistent adb shell is stale.
     if ($script:adb) { try { $script:adb.Dispose() } catch { }; $script:adb = $null }
+    if ($null -ne $script:launchState) { $script:launchState.RetryDoneAt = Get-Date }
     Write-WinoidLog 'launch retry finished'
 }
 
@@ -3950,7 +4062,14 @@ $launchTimer.Add_Tick({
     Invoke-Safe 'launchTimer' {
     Complete-LaunchPrepJob
     Complete-LaunchRetryJob
-    if (-not $script:launchState) { $launchTimer.Stop(); return }
+    if (-not $script:launchState) {
+        # The launch state is also cleared from the fail paths outside this
+        # tick. Stopping the timer alone used to leave the loader up forever;
+        # keep it only when the install flow is still using the same overlay.
+        if ($null -eq $script:installJob) { $loader.Hide() }
+        $launchTimer.Stop()
+        return
+    }
     $st = $script:launchState
     $st.Ticks++
     $sec = $st.Ticks
@@ -4023,18 +4142,43 @@ $launchTimer.Add_Tick({
         $script:launchRetryJob = Start-AndroidRetryJob $st.App.Package ([string]$st.LaunchCmd) ([string]$st.SizeArg) ([string]$st.DensityArg)
     }
 
-    if ($sec -ge 180) {
+    # The retry repaired WSLg and restarted Android. If its window is still
+    # absent a minute later, waiting another two minutes only hides the real
+    # problem from the user.
+    if ($st.Prepared -and -not $st.Wrapped -and $null -ne $st.RetryDoneAt -and
+        ((Get-Date) - $st.RetryDoneAt).TotalSeconds -gt 60) {
         $loader.Hide()
         $launchTimer.Stop()
         Stop-LaunchJobs
+        Write-WinoidLog "launch gave up after retry: $($st.App.Package)"
+        Set-Footer 'Окно не появилось. WSLg не выводит окна Linux — перезапустите Windows.'
         $script:launchState = $null
-        Set-Footer 'Окно не появилось за 3 минуты. Проверьте состояние Android.'
+    }
+
+    if ($sec -ge 300) {
+        $loader.Hide()
+        $launchTimer.Stop()
+        Stop-LaunchJobs
+        if ($st.Wrapped) {
+            # Auto-hide is off and the user left the indicator up: the window
+            # is there, so this is not a failure.
+            Set-Footer 'Окно открыто.'
+        } else {
+            Set-Footer 'Окно не появилось за 5 минут. Проверьте состояние Android.'
+        }
+        $script:launchState = $null
     }
     }
 })
 
 function Start-AppLaunch($app) {
     if ($null -eq $app) { return }
+    # The loading overlay is shared with the install flow: launching now would
+    # overwrite the install progress and its result.
+    if ($null -ne $script:installJob -and $installTimer.IsEnabled) {
+        Set-Footer 'Дождитесь установки APK, затем запустите приложение.'
+        return
+    }
     # The startup/session probe already keeps sessionRunning current. A direct
     # Test-Backend here was another WSL round-trip on the UI thread before the
     # launch; if Android is gone the background job reports it instead.
@@ -4125,6 +4269,7 @@ function Start-AppLaunch($app) {
         Wrapped = $false
         Prepared = $false
         Retried = $false
+        RetryDoneAt = $null
         LaunchCmd = ''
         Frames = @()
         Size = $sizeChoice
@@ -4188,11 +4333,24 @@ $installTimer.Add_Tick({
     if ($sec -lt 60) { $loaderElapsed.Text = "$sec сек" } else { $loaderElapsed.Text = ('{0}:{1:00}' -f [int]($sec / 60), ($sec % 60)) }
     $exited = $false
     try { $exited = [bool]$script:installJob.HasExited } catch { $exited = $true }
+    # adb install can wedge on an offline device. Without this cap the loader
+    # stayed on screen forever and the manager refused every new install.
+    $timedOut = (-not $exited -and ([DateTime]::UtcNow - $script:installStartAt).TotalSeconds -gt 300)
+    if ($timedOut) {
+        Write-WinoidLog 'install worker timed out; stopping it'
+        try { $script:installJob.Kill($true) } catch { }
+        try { [void]$script:installJob.WaitForExit(3000) } catch { }
+        $exited = $true
+    }
     if ($exited) {
         $out = ''
         $jobLogPath = Join-Path $script:dataRoot 'install.log'
         try { $out = [System.IO.File]::ReadAllText($jobLogPath) } catch { }
-        Write-WinoidLog "install job exited: $(($out -split "`r?`n" | Select-Object -Last 2) -join ' ')"
+        # Only the worker's own final marker is trustworthy: a stale log from a
+        # previous run must never be reported as a successful install.
+        $code = -1
+        if ($out -match 'WINOID_INSTALL_EXIT=(-?\d+)') { $code = [int]$matches[1] }
+        Write-WinoidLog "install job exited: code=$code $(($out -split "`r?`n" | Select-Object -Last 2) -join ' ')"
         try { $script:installJob.Dispose() } catch { }
         $script:installJob = $null
         if ($script:installStagePath) {
@@ -4203,7 +4361,8 @@ $installTimer.Add_Tick({
         $loader.Hide()
         Invoke-Safe 'install.refresh' { Refresh-Apps }
         $last = (($out -split "`r?`n") | Where-Object { $_.Trim().Length -gt 0 -and $_ -notmatch '^WINOID_INSTALL_EXIT=' } | Select-Object -Last 1)
-        if ($out -match 'WINOID_INSTALL_EXIT=0') { Set-Footer 'APK установлен.' }
+        if ($timedOut) { Set-Footer 'Установка прервана: Android не ответил за 5 минут.' }
+        elseif ($code -eq 0) { Set-Footer 'APK установлен.' }
         elseif ($last) { Set-Footer "Установка не удалась: $last" }
         else { Set-Footer 'Установка не удалась. Подробности: %LOCALAPPDATA%\Winoid\install.log' }
     }
@@ -4221,9 +4380,20 @@ function Install-Apk([string]$path) {
         }
         try { $script:installJob.Dispose() } catch { }
         $script:installJob = $null
+        if ($script:installStagePath) {
+            Remove-Item -LiteralPath $script:installStagePath -Force -ErrorAction SilentlyContinue
+            $script:installStagePath = ''
+        }
     }
     if ($null -ne $script:sessionJob -and $sessionTimer.IsEnabled) {
         Set-Footer 'Дождитесь запуска Android, затем повторите установку.'
+        return
+    }
+    # The loader is shared with the launch flow: starting an install in the
+    # middle of a launch would replace its progress text and let the launch
+    # timer overwrite the install result.
+    if ($null -ne $script:launchState -and -not $script:launchState.Wrapped) {
+        Set-Footer 'Дождитесь запуска приложения, затем повторите установку.'
         return
     }
 
@@ -4234,7 +4404,7 @@ function Install-Apk([string]$path) {
     if (-not (Test-Path -LiteralPath $stageDir)) { New-Item -ItemType Directory -Path $stageDir -Force | Out-Null }
     $script:installStagePath = Join-Path $stageDir ('install-' + [guid]::NewGuid().ToString('N') + '.apk')
     try { Copy-Item -LiteralPath $apk -Destination $script:installStagePath -Force } catch {
-        Set-Footer 'Не удалось скопировать APK. Попробуйте другой-path.'
+        Set-Footer 'Не удалось скопировать APK. Попробуйте другой файл.'
         $script:installStagePath = ''
         return
     }
@@ -4261,6 +4431,11 @@ function Install-Apk([string]$path) {
     Write-WinoidLog "install start ($mode): $apk"
 
     $script:installTicks = 0
+    $script:installStartAt = [DateTime]::UtcNow
+    # Drop the previous run's log before the worker starts: the timer treats a
+    # stale "WINOID_INSTALL_EXIT=0" as a fresh success otherwise.
+    $jobLog = Join-Path $script:dataRoot 'install.log'
+    Remove-Item -LiteralPath $jobLog -Force -ErrorAction SilentlyContinue
     $loaderTitle.Text = 'Установка APK'
     $loaderSub.Text = "Отправляю $(Split-Path -Leaf $apk) в Android…"
     $loaderElapsed.Text = '0 сек'
@@ -4271,11 +4446,12 @@ function Install-Apk([string]$path) {
     $jobExe = $exe
     $jobDistro = $script:wslDistro
     $jobSerial = $script:adbSerial
-    $jobLog = Join-Path $script:dataRoot 'install.log'
     $jobAdb = $script:adbPath
     $worker = Join-Path $script:baseDir 'assets\installjob.ps1'
+    $pwshExe = Join-Path $PSHOME 'pwsh.exe'
+    if (-not (Test-Path -LiteralPath $pwshExe)) { $pwshExe = 'pwsh.exe' }
     try {
-        $args = @(
+        $workerArgs = @(
             '-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-File', $worker,
             '-Mode', $mode,
             '-WslExe', $jobExe,
@@ -4285,8 +4461,8 @@ function Install-Apk([string]$path) {
             '-ApkPath', $apkArg,
             '-LogFile', $jobLog
         )
-        $quoted = @($args | ForEach-Object { '"' + ([string]$_) + '"' })
-        $script:installJob = Start-Process -FilePath 'pwsh.exe' -ArgumentList $quoted -WindowStyle Hidden -PassThru
+        $quoted = @($workerArgs | ForEach-Object { '"' + ([string]$_) + '"' })
+        $script:installJob = Start-Process -FilePath $pwshExe -ArgumentList $quoted -WindowStyle Hidden -PassThru
     } catch {
         $script:installJob = $null
         if ($script:installStagePath) {
@@ -4606,13 +4782,19 @@ $sessionTimer.Add_Tick({
             $loaderSub.Text = 'Android загружается…'
             return
         }
-        $state = 'Unknown'
-        try { $state = [string]$script:sessionJob.State } catch { }
-        if ($state -in @('Completed', 'Failed', 'Stopped')) {
-            $out = ''
-            try { $out = @(Receive-Job -Job $script:sessionJob -ErrorAction SilentlyContinue) | Out-String } catch { }
-            Write-WinoidLog "session job $state`: $out"
-            Remove-Job -Job $script:sessionJob -Force -ErrorAction SilentlyContinue
+        $exited = $false
+        try { $exited = [bool]$script:sessionJob.HasExited } catch { $exited = $true }
+        if (-not $exited -and $script:sessionTicks -ge 120) {
+            Write-WinoidLog 'session job timed out; stopping it'
+            try { $script:sessionJob.Kill($true) } catch { }
+            try { [void]$script:sessionJob.WaitForExit(3000) } catch { }
+            $exited = $true
+        }
+        if ($exited) {
+            $code = -1
+            try { $code = [int]$script:sessionJob.ExitCode } catch { }
+            Write-WinoidLog "session job exited: code=$code"
+            try { $script:sessionJob.Dispose() } catch { }
             $script:sessionJob = $null
             $script:sessionWaiting = $true
             $loaderSub.Text = 'Android загружается…'
@@ -4713,14 +4895,14 @@ function Start-Session {
         return
     }
     if ($null -ne $script:sessionJob) {
-        $state = 'Unknown'
-        try { $state = [string]$script:sessionJob.State } catch { }
-        if ($state -notin @('Completed', 'Failed', 'Stopped')) {
+        $busy = $false
+        try { $busy = -not [bool]$script:sessionJob.HasExited } catch { }
+        if ($busy) {
             $loader.Show()
             Set-Footer 'Android уже запускается…'
             return
         }
-        Remove-Job -Job $script:sessionJob -Force -ErrorAction SilentlyContinue
+        try { $script:sessionJob.Dispose() } catch { }
         $script:sessionJob = $null
     }
     $script:sessionRunning = $false
@@ -4732,16 +4914,19 @@ function Start-Session {
     $loader.Show()
     $loaderBar.IsIndeterminate = $true
     Set-Footer $(if ($Restart) { 'Перезапуск Android…' } else { 'Запуск Android…' })
-    $jobWsl = $script:wsl
-    $jobDistro = $script:wslDistro
     $action = $(if ($Restart) { 'restart' } else { 'start' })
     try {
-        $script:sessionJob = Start-Job -ScriptBlock {
-            param($wslExe, $distro, $verb)
-            $wslArgs = @()
-            if (-not [string]::IsNullOrWhiteSpace($distro)) { $wslArgs += @('-d', $distro) }
-            & $wslExe @wslArgs -- bash -lc "systemctl --user $verb waydroid-session.service" 2>&1
-        } -ArgumentList $jobWsl, $jobDistro, $action
+        # Start-Job + '& wsl.exe' hangs indefinitely on this machine (the same
+        # pattern that made APK installs freeze). A hidden process whose
+        # HasExited is polled by the timer is reliable.
+        $psi = [System.Diagnostics.ProcessStartInfo]::new()
+        $psi.FileName = $script:wsl
+        foreach ($a in ((Get-WslBase) + @('--', 'bash', '-lc', "systemctl --user $action waydroid-session.service"))) {
+            [void]$psi.ArgumentList.Add([string]$a)
+        }
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $script:sessionJob = [System.Diagnostics.Process]::Start($psi)
     } catch {
         Write-WinoidLog ("ERROR session start: " + $_.Exception.ToString())
         $script:sessionJob = $null
@@ -5129,7 +5314,11 @@ $window.Add_Closing({
         Stop-LaunchJobs -ForceStopPackage $pendingPkg
         if ($script:installJob) { try { $script:installJob.Kill($true) } catch { }; try { $script:installJob.Dispose() } catch { } }
         if ($script:installStagePath) { try { Remove-Item -LiteralPath $script:installStagePath -Force -ErrorAction SilentlyContinue } catch { } }
-        if ($script:sessionJob) { Remove-Job -Job $script:sessionJob -Force -ErrorAction SilentlyContinue }
+        if ($script:sessionJob) {
+            try { $script:sessionJob.Kill($true) } catch { try { $script:sessionJob.Kill() } catch { } }
+            try { $script:sessionJob.Dispose() } catch { }
+            $script:sessionJob = $null
+        }
         if ($script:iconJob) {
             try { $script:iconJob.Kill($true) } catch { try { $script:iconJob.Kill() } catch { } }
             try { $script:iconJob.Dispose() } catch { }
