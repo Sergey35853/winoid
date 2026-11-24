@@ -566,7 +566,7 @@ function Initialize-WinoidData {
 # Optional config: %LOCALAPPDATA%\Winoid\config.json
 # { "wslDistro": "Winoid", "adbSerial": "192.168.240.112:5555" }
 $script:dataRoot = Initialize-WinoidData
-$script:appVersion = '0.1.53'
+$script:appVersion = '0.1.54'
 $script:iconQueue = New-Object System.Collections.Queue
 $script:geometryPath = Join-Path $script:dataRoot 'geometry.json'
 $script:appGeometry = @{}
@@ -2990,6 +2990,42 @@ function New-AppWrapper($app, [IntPtr]$source, $size, $frames = $null) {
         $pane | Add-Member -NotePropertyName CropX -NotePropertyValue 0 -Force
         $pane | Add-Member -NotePropertyName CropY -NotePropertyValue 0 -Force
     }
+    # WSLg wraps every game surface in a 12 px transparent shadow. Keeping it
+    # in the capture used to leave a bright band on the left/top edge of the
+    # wrapper and made the picture 24 px larger than the game. Crop the
+    # shadow and measure taps from the Android frame origin instead.
+    if ($app.Package -ne 'com.android.settings' -and $panes.Count -eq 1 -and $androidFrames.Count -gt 0) {
+        $p0 = $panes[0]
+        $fit = $null; $fitDelta = 99999
+        foreach ($f in $androidFrames) {
+            $d = [math]::Abs([int]$p0.W - [int]$f.W) + [math]::Abs([int]$p0.H - [int]$f.H)
+            if ($d -lt $fitDelta) { $fit = $f; $fitDelta = $d }
+        }
+        if ($null -ne $fit) {
+            $dw2 = [int]$p0.W - [int]$fit.W
+            $dh2 = [int]$p0.H - [int]$fit.H
+            if ($dw2 -ge 8 -and $dh2 -ge 8) {
+                # Locate the real content rect: the shadow is not always split
+                # evenly, and assuming halves can leave a 4-8 px band behind.
+                $off = $null
+                if ($dw2 -ge 12 -and $dh2 -ge 12) {
+                    try { $off = Get-WindowContentOffset $p0.Source ([int]$p0.W) ([int]$p0.H) ([int]$fit.W) ([int]$fit.H) } catch { }
+                }
+                if ($null -ne $off) {
+                    $p0.CropX = [int]$off[0]; $p0.CropY = [int]$off[1]
+                } else {
+                    $p0.CropX = [int][math]::Round($dw2 / 2)
+                    $p0.CropY = [int][math]::Round($dh2 / 2)
+                }
+                $p0 | Add-Member -NotePropertyName AndroidL -NotePropertyValue ([int]$fit.L) -Force
+                $p0 | Add-Member -NotePropertyName AndroidT -NotePropertyValue ([int]$fit.T) -Force
+                $srcW = [int]$fit.W
+                $frameH = [int]$fit.H - [int]$spec.NavInset
+                if ($frameH -ge 60) { $srcH = $frameH }
+                try { Write-WinoidLog "game surface cropped: shadow=$($p0.CropX),$($p0.CropY) src=${srcW}x${srcH} frame=$($fit.L),$($fit.T)" } catch { }
+            }
+        }
+    }
     # WSLg often adds a translucent shadow around a surface, but it is not
     # always centered: unparked windows sometimes keep all 24 px on the
     # right/bottom. Locate the Android content rectangle inside the capture
@@ -3086,7 +3122,13 @@ function New-AppWrapper($app, [IntPtr]$source, $size, $frames = $null) {
         $vx = [int]($pane.Left - $spec.MinLeft)
         $vy = [int]($pane.Top - $spec.MinTop)
         $visH = [int]($pane.H - $spec.NavInset)
-        if ($visH -gt ($srcH - $vy)) { $visH = $srcH - $vy }
+        # VisH is measured from the pane's top edge, while the capture starts
+        # at CropY (the shadow). Keep the crop offset in the bound, otherwise
+        # a cropped surface loses its bottom 12 rows.
+        $cyCrop = 0
+        $cyProp = $pane.PSObject.Properties['CropY']
+        if ($null -ne $cyProp) { $cyCrop = [int]$cyProp.Value }
+        if (($visH - $cyCrop) -gt ($srcH - $vy)) { $visH = $srcH - $vy + $cyCrop }
         if ($visH -lt 1) { $visH = [int]$pane.H }
         # Hide the Android freeform title bar (back arrow + window buttons)
         # by cropping it from the captured frame. Immersive panes have no bar.

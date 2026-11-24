@@ -98,6 +98,8 @@ Assert-True ($text.Contains('package manager can take')) 'activity resolution wa
 Assert-True ($text.Contains('Start-AndroidRetryJob $st.App.Package ([string]$st.LaunchCmd) ([string]$st.SizeArg)')) 'retry keeps the display geometry'
 Assert-True ($text.Contains('if (-not $w.Settled) { $lumaSum +=')) 'luma sampling is skipped while playing'
 Assert-True ($text.Contains('if ($null -eq $script:installJob) { $loader.Hide() }')) 'loader is hidden when the launch state is dropped'
+Assert-True ($text.Contains('game surface cropped')) 'game surface shadow is cropped from the capture'
+Assert-True ($text.Contains('loses its bottom 12 rows')) 'cropped surface keeps its full height'
 Assert-True ($text.Contains('ARM compatibility is synchronized by the background launch job')) 'ARM compatibility runs with the background launch job'
 $iconJobSrc = Get-Content -LiteralPath (Join-Path $root 'assets\iconjob.ps1') -Raw
 Assert-True ($iconJobSrc -match '\[string\]\$Lnk') 'icon worker works without a desktop shortcut'
