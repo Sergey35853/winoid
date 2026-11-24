@@ -566,7 +566,7 @@ function Initialize-WinoidData {
 # Optional config: %LOCALAPPDATA%\Winoid\config.json
 # { "wslDistro": "Winoid", "adbSerial": "192.168.240.112:5555" }
 $script:dataRoot = Initialize-WinoidData
-$script:appVersion = '0.1.54'
+$script:appVersion = '0.1.55'
 $script:iconQueue = New-Object System.Collections.Queue
 $script:geometryPath = Join-Path $script:dataRoot 'geometry.json'
 $script:appGeometry = @{}
@@ -1266,7 +1266,7 @@ $script:wrapperXaml = @'
       </Grid>
     </Border>
     <Grid>
-      <Image x:Name="View" Stretch="Uniform" RenderOptions.BitmapScalingMode="HighQuality"/>
+      <Image x:Name="View" Stretch="Uniform" RenderOptions.BitmapScalingMode="Linear"/>
       <Border x:Name="Loading" Background="#E60B0C0E" IsHitTestVisible="False">
         <StackPanel HorizontalAlignment="Center" VerticalAlignment="Center">
           <Border Width="46" Height="46" CornerRadius="12" Background="#2A3550" HorizontalAlignment="Center">
@@ -3601,9 +3601,16 @@ $script:frameTimer.Interval = [TimeSpan]::FromMilliseconds(50)
 $script:frameTimer.Add_Tick({
     try {
         $script:frameTick++
-        # Adaptive capture: 30 fps during a short burst after input, 20 fps
-        # otherwise so the software-rendered game gets the freed-up CPU.
-        $wantMs = $(if ([DateTime]::UtcNow -lt $script:inputBurstUntil) { 33 } else { 50 })
+        # Adaptive capture. The software-rendered game produces roughly 25
+        # frames per second, so 30 fps while its wrapper is in use shows every
+        # frame; the old 20 fps baseline visibly dropped frames and felt like
+        # stutter. An idle wrapper only needs an occasional refresh, and that
+        # leaves the CPU to the game while the user is elsewhere.
+        $wantMs = 60
+        foreach ($ww in @($script:wrappers)) {
+            if ($null -ne $ww -and -not $ww.Closed -and $ww.Window.IsActive) { $wantMs = 33; break }
+        }
+        if ([DateTime]::UtcNow -lt $script:inputBurstUntil) { $wantMs = 33 }
         if ($script:frameTimer.Interval.TotalMilliseconds -ne $wantMs) {
             $script:frameTimer.Interval = [TimeSpan]::FromMilliseconds($wantMs)
         }
@@ -3651,6 +3658,10 @@ $script:frameTimer.Add_Tick({
                 }
                 $sr = New-Object NativeWin+RECT
                 [void][NativeWin]::GetWindowRect($pane.Source, [ref]$sr)
+                # A monitor added or rearranged after launch can turn the park
+                # position into an on-screen one. Keep the surface beyond the
+                # current desktop instead of trusting the stored coordinate.
+                if ($pane.ParkX -lt $vs.Right + 8) { $pane.ParkX = $vs.Right + 200 }
                 if ([math]::Abs($sr.Left - $pane.ParkX) -gt 1 -or [math]::Abs($sr.Top - $pane.ParkY) -gt 1) {
                     if ([NativeWin]::IsZoomed($pane.Source)) { [void][NativeWin]::ShowWindow($pane.Source, 9) }
                     [void][NativeWin]::SetWindowPos($pane.Source, [IntPtr]::Zero, $pane.ParkX, $pane.ParkY, $pane.W, $pane.H, 0x0010)
@@ -3672,7 +3683,14 @@ $script:frameTimer.Add_Tick({
                 $ecProp = $pane.PSObject.Properties['EdgeCrop']
                 $ec = 0
                 if ($null -ne $ecProp) { $ec = [int]$ecProp.Value }
-                [void]$pane.Grab.Capture($pane.Source)
+                # PrintWindow takes 13-30 ms on a WSLg surface. Running it on
+                # the dispatcher froze input and animations for most of each
+                # frame. Publish the frame the worker finished last tick, then
+                # start the next one on the thread pool: the UI thread only
+                # copies pixels and never waits for the capture.
+                $grabbed = $false
+                try { $grabbed = $pane.Grab.CaptureComplete() } catch { $grabbed = $false }
+                if (-not $grabbed) { [void]$pane.Grab.CaptureBegin($pane.Source); continue }
                 $srcRect = [System.Windows.Int32Rect]::new($cx + $ec, $cy + $capPx + $ec, [Math]::Max(1, $vw - 2 * $ec), [Math]::Max(1, $vh - 2 * $ec))
                 $w.Wb.WritePixels($srcRect, $pane.Grab.Bits, [int]$pane.Grab.ByteSize, $pane.Grab.Stride, [int]$pane.VX, [int]$pane.VY)
                 # Luma sampling costs ~30k unmanaged reads per pane. It is only
@@ -3680,11 +3698,16 @@ $script:frameTimer.Add_Tick({
                 # playing so more CPU goes to the game and taps feel faster.
                 if (-not $w.Settled) { $lumaSum += $pane.Grab.MeanLuma() * $vh }
                 $lumaRows += $vh
+                # Only now is the DIB free for the next capture: starting it
+                # before WritePixels would let PrintWindow overwrite pixels
+                # while the UI thread copies them.
+                [void]$pane.Grab.CaptureBegin($pane.Source)
             }
             foreach ($extra in @($w.Parked)) {
                 if ($null -eq $extra -or -not [NativeWin]::IsWindow($extra.Source)) { continue }
                 $er = New-Object NativeWin+RECT
                 [void][NativeWin]::GetWindowRect($extra.Source, [ref]$er)
+                if ($extra.ParkX -lt $vs.Right + 8) { $extra.ParkX = $vs.Right + 200 }
                 if ([math]::Abs($er.Left - $extra.ParkX) -gt 1 -or [math]::Abs($er.Top - $extra.ParkY) -gt 1) {
                     [void][NativeWin]::SetWindowPos($extra.Source, [IntPtr]::Zero, $extra.ParkX, $extra.ParkY, $extra.W, $extra.H, 0x0010)
                 }
@@ -3694,7 +3717,14 @@ $script:frameTimer.Add_Tick({
             # window with '<' and window buttons is not visible behind Winoid.
             $sweepAt = $null
             try { $sweepAt = [DateTime]$w.ParkSweepAt } catch { }
-            if ($null -eq $sweepAt -or ([DateTime]::UtcNow - $sweepAt).TotalMilliseconds -ge 700) {
+            # Late Android surfaces only appear while an app is starting. Once
+            # the window has settled, sweeping every frame costs a process
+            # enumeration plus a window walk and adds nothing.
+            $sweepEvery = 700
+            try {
+                if ($null -ne $w.LoadStart -and ([DateTime]::UtcNow - $w.LoadStart).TotalSeconds -ge 15) { $sweepEvery = 3000 }
+            } catch { }
+            if ($null -eq $sweepAt -or ([DateTime]::UtcNow - $sweepAt).TotalMilliseconds -ge $sweepEvery) {
                 $w.ParkSweepAt = [DateTime]::UtcNow
                 $rootOwner = [NativeWin]::GetAncestor($w.Source, 3)
                 $known = New-Object 'System.Collections.Generic.HashSet[System.IntPtr]'
@@ -3810,6 +3840,27 @@ $script:launchWorker = {
     $root = @('-u', 'root')
     $defaultLaunchCmd = $launchCmd
 
+    # Apply the requested display geometry and make sure Android really took
+    # it. adb is 'offline' for a moment after a session or container restart;
+    # 'wm size' then fails without a sound, the game lays itself out for the
+    # narrower physical display, and the wrapper ends up clipped on the right
+    # with every tap shifted. Reconnect and retry instead.
+    function Set-DisplaySizeVerified {
+        $null = Invoke-W ($base + @('--', 'adb', '-s', $serial, 'shell', 'wm', 'size', $sizeArg)) 10000
+        $null = Invoke-W ($base + @('--', 'adb', '-s', $serial, 'shell', 'wm', 'density', $densityArg)) 10000
+        if ($sizeArg -eq 'reset') { return $true }
+        $want = '(?m)^\s*(Override|Physical) size:\s*' + [regex]::Escape($sizeArg) + '\s*$'
+        for ($i = 0; $i -lt 3; $i++) {
+            $cur = Invoke-W ($base + @('--', 'adb', '-s', $serial, 'shell', 'wm', 'size')) 10000
+            if ([string]$cur.Out -match $want) { return $true }
+            $null = Invoke-W ($base + @('--', 'bash', '-lc', "adb connect $serial >/dev/null 2>&1")) 12000
+            Start-Sleep -Milliseconds 500
+            $null = Invoke-W ($base + @('--', 'adb', '-s', $serial, 'shell', 'wm', 'size', $sizeArg)) 10000
+            Start-Sleep -Milliseconds 300
+        }
+        return $false
+    }
+
     # 'waydroid app launch' sometimes fails to resolve a game's launcher
     # activity and silently leaves Android on the home screen. Resolving the
     # activity with adb and starting it explicitly works reliably.
@@ -3859,12 +3910,15 @@ $script:launchWorker = {
         return Get-WslgSurfaceState
     }
     function Restart-WaydroidSession {
-        $null = Invoke-W ($base + @('--', 'bash', '-lc', 'systemctl --user restart waydroid-session.service')) 30000
+        # 'systemctl --user' needs the runtime dir; without it the command
+        # fails instantly and the "restart" does nothing.
+        $null = Invoke-W ($base + @('--', 'bash', '-lc', 'export XDG_RUNTIME_DIR=/run/user/$(id -u); systemctl --user restart waydroid-session.service')) 30000
         for ($i = 0; $i -lt 50; $i++) {
             Start-Sleep -Milliseconds 1000
             $s = Invoke-W ($base + $root + @('--', 'waydroid', 'status')) 15000
             if ($s.Out -match '(?m)^Container:\s*RUNNING') { break }
         }
+        $null = Invoke-W ($base + @('--', 'bash', '-lc', "adb connect $serial >/dev/null 2>&1")) 12000
         Start-Sleep -Seconds 6
     }
 
@@ -3890,8 +3944,7 @@ $script:launchWorker = {
     if ($mode -eq 'retry') {
         $wslg = Sync-WslgSurface
         Restart-WaydroidSession
-        $null = Invoke-W ($base + @('--', 'adb', '-s', $serial, 'shell', 'wm', 'size', $sizeArg)) 10000
-        $null = Invoke-W ($base + @('--', 'adb', '-s', $serial, 'shell', 'wm', 'density', $densityArg)) 10000
+        $null = Set-DisplaySizeVerified
         $null = Start-AppWindow
         [pscustomobject]@{ Ok = $true; Stage = 'retry'; Message = "wslg=$wslg" }
         return
@@ -3958,8 +4011,7 @@ $script:launchWorker = {
 
     # Always send both: 'reset' restores the physical display, a concrete
     # value applies the mode picked in the manager.
-    $null = Invoke-W ($base + @('--', 'adb', '-s', $serial, 'shell', 'wm', 'size', $sizeArg)) 10000
-    $null = Invoke-W ($base + @('--', 'adb', '-s', $serial, 'shell', 'wm', 'density', $densityArg)) 10000
+    $null = Set-DisplaySizeVerified
     Start-Sleep -Milliseconds 600
     # A stale activity with no WSLg surface never creates a new window.
     $null = Invoke-W ($base + @('--', 'adb', '-s', $serial, 'shell', 'am', 'force-stop', $pkg)) 8000

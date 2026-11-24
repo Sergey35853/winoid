@@ -101,6 +101,12 @@ Assert-True ($text.Contains('if ($null -eq $script:installJob) { $loader.Hide() 
 Assert-True ($text.Contains('game surface cropped')) 'game surface shadow is cropped from the capture'
 Assert-True ($text.Contains('loses its bottom 12 rows')) 'cropped surface keeps its full height'
 Assert-True ($text.Contains('ARM compatibility is synchronized by the background launch job')) 'ARM compatibility runs with the background launch job'
+Assert-True ($text.Contains('Set-DisplaySizeVerified')) 'launch verifies the requested display size'
+Assert-True ($text.Contains('(Override|Physical) size:')) 'display check reads what Android actually reports'
+Assert-True ($text.Contains('export XDG_RUNTIME_DIR=/run/user/$(id -u); systemctl --user restart waydroid-session.service')) 'retry restarts the user session with its runtime dir'
+Assert-True (-not $text.Contains('{ 33 } else { 50 }')) 'capture is not throttled to 20 fps while a game window is in use'
+Assert-True ($text.Contains('$ww.Window.IsActive')) 'the active wrapper is captured at the full rate'
+Assert-True ($text.Contains('$pane.ParkX = $vs.Right + 200')) 'parked surfaces follow a changed desktop'
 $iconJobSrc = Get-Content -LiteralPath (Join-Path $root 'assets\iconjob.ps1') -Raw
 Assert-True ($iconJobSrc -match '\[string\]\$Lnk') 'icon worker works without a desktop shortcut'
 $installWorkerSrc = Get-Content -LiteralPath (Join-Path $root 'assets\installjob.ps1') -Raw
