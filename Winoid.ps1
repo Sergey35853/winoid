@@ -188,7 +188,17 @@ public class NativeWin {
         return list.ToArray();
     }
 
+    [DllImport("user32.dll")] public static extern int GetClassName(IntPtr h, StringBuilder s, int n);
+
     public static IntPtr FindWindowContains(string needle, string exclude) {
+        return FindWindowContains(needle, exclude, null, null);
+    }
+
+    // Android apps are exported by WSLg as RAIL_WINDOW surfaces owned by
+    // msrdc. A title-only search is dangerous: Windows Settings, the Winoid
+    // loader and other apps can share the localized name ("Настройки"), and
+    // the wrapper then captures a Windows window instead of Android.
+    public static IntPtr FindWindowContains(string needle, string exclude, string processName, string className) {
         IntPtr found = IntPtr.Zero;
         EnumWindows((h, lp) => {
             if (!IsWindowVisible(h)) return true;
@@ -197,8 +207,20 @@ public class NativeWin {
             var t = sb.ToString();
             if (t.Length == 0) return true;
             if (!String.IsNullOrEmpty(exclude) && t.IndexOf(exclude, StringComparison.OrdinalIgnoreCase) >= 0) return true;
-            if (t.IndexOf(needle, StringComparison.OrdinalIgnoreCase) >= 0) { found = h; return false; }
-            return true;
+            if (t.IndexOf(needle, StringComparison.OrdinalIgnoreCase) < 0) return true;
+            if (!String.IsNullOrEmpty(processName)) {
+                uint pid; GetWindowThreadProcessId(h, out pid);
+                try {
+                    if (!String.Equals(Process.GetProcessById((int)pid).ProcessName, processName, StringComparison.OrdinalIgnoreCase)) return true;
+                } catch { return true; }
+            }
+            if (!String.IsNullOrEmpty(className)) {
+                var cs = new StringBuilder(256);
+                GetClassName(h, cs, 256);
+                if (!String.Equals(cs.ToString(), className, StringComparison.OrdinalIgnoreCase)) return true;
+            }
+            found = h;
+            return false;
         }, IntPtr.Zero);
         return found;
     }
@@ -566,7 +588,7 @@ function Initialize-WinoidData {
 # Optional config: %LOCALAPPDATA%\Winoid\config.json
 # { "wslDistro": "Winoid", "adbSerial": "192.168.240.112:5555" }
 $script:dataRoot = Initialize-WinoidData
-$script:appVersion = '0.1.55'
+$script:appVersion = '0.1.56'
 $script:iconQueue = New-Object System.Collections.Queue
 $script:geometryPath = Join-Path $script:dataRoot 'geometry.json'
 $script:appGeometry = @{}
@@ -2160,12 +2182,16 @@ function Refresh-Apps {
     $dexPath = Join-Path $script:baseDir 'assets\winoid-icon.dex'
     $script:appsJob = Start-Job -ScriptBlock {
         param([string]$Wsl, [string]$Distro, [string]$Serial, [string]$Dex, [string]$DataRoot)
-        function Invoke-W([string[]]$Args, [int]$Ms) {
+        function Invoke-W([string[]]$Arguments, [int]$Ms) {
             $psi = [System.Diagnostics.ProcessStartInfo]::new()
             $psi.FileName = $Wsl
-            foreach ($a in $Args) { [void]$psi.ArgumentList.Add($a) }
+            foreach ($a in $Arguments) { [void]$psi.ArgumentList.Add($a) }
             $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
             $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+            # Localized Android labels are UTF-8; without this they reach the
+            # list as mojibake on a Russian or Chinese system.
+            $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+            $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
             $p = [System.Diagnostics.Process]::Start($psi)
             $o = $p.StandardOutput.ReadToEndAsync(); $e = $p.StandardError.ReadToEndAsync()
             if (-not $p.WaitForExit($Ms)) { try { $p.Kill() } catch { }; return @{ Out = ''; Err = 'timeout'; Code = -1 } }
@@ -2425,6 +2451,31 @@ function Get-AndroidTopActivity {
     return ''
 }
 
+# Settings uses Activity Embedding on large displays: a detail opens in a
+# second freeform window whose width is not the base window's width. Find the
+# exact Android frame of the top activity so the wrapper can follow it and
+# map taps to the right display coordinates.
+function Get-AndroidActivityFrame([string]$component) {
+    if ([string]::IsNullOrWhiteSpace($component)) { return $null }
+    if ($component -notmatch '/') { return $null }
+    if ($null -eq $script:adb -or -not $script:adb.Running) { Initialize-Adb }
+    if ($null -eq $script:adb -or -not $script:adb.Running) { return $null }
+    $cls = ($component -split '/', 2)[1]
+    if ([string]::IsNullOrWhiteSpace($cls)) { return $null }
+    $pat = [regex]::Escape($cls)
+    try {
+        $text = [string]$script:adb.SendQuery("dumpsys window windows | grep -A24 'Window #.*$pat' | grep -m1 'Frames:'", 3000)
+    } catch { return $null }
+    if ($text -match 'frame=\[(-?\d+),(-?\d+)\]\[(-?\d+),(-?\d+)\]') {
+        $l = [int]$matches[1]; $t = [int]$matches[2]
+        $r = [int]$matches[3]; $b = [int]$matches[4]
+        if ($r - $l -gt 100 -and $b - $t -gt 100) {
+            return [pscustomobject]@{ L = $l; T = $t; W = ($r - $l); H = ($b - $t) }
+        }
+    }
+    return $null
+}
+
 # Settings keeps the previous activity alive below the current one. After
 # Back the old sub-surface can stay on top of the list with a stale picture,
 # so Sync-SettingsSurface prefers the root window when Android reports it.
@@ -2438,7 +2489,14 @@ function Update-SettingsActivity($w) {
     $top = Get-AndroidTopActivity
     if ([string]::IsNullOrWhiteSpace($top)) { return }
     $w.SettingsTop = $top
-    try { Write-WinoidLog "settings top $top" } catch { }
+    $frame = $null
+    if ($top -match '^com\.android\.settings/') { $frame = Get-AndroidActivityFrame $top }
+    $w.SettingsFrame = $frame
+    if ($null -ne $frame) {
+        try { Write-WinoidLog "settings top $top frame=$($frame.L),$($frame.T) $($frame.W)x$($frame.H)" } catch { }
+    } else {
+        try { Write-WinoidLog "settings top $top frame=?" } catch { }
+    }
     $w.SettingsSyncAt = [DateTime]::MinValue
 }
 
@@ -2701,15 +2759,14 @@ function Sync-SettingsSurface($w) {
     $ownerRoot = [NativeWin]::GetAncestor($anchor, 3)
 
     # EnumWindows returns top-level windows top-to-bottom.
-    $candidates = @()
+    $family = @()
     foreach ($wnd in $wins) {
         if (-not $wnd.Visible) { continue }
         if ([NativeWin]::GetAncestor($wnd.Hwnd, 3) -ne $ownerRoot) { continue }
         if ($wnd.Width -lt 240 -or $wnd.Height -lt 240) { continue }
-        if ([math]::Abs($wnd.Width - $tw) -gt 48 -or [math]::Abs($wnd.Height - $th) -gt 48) { continue }
-        $candidates += $wnd
+        $family += $wnd
     }
-    if ($candidates.Count -eq 0) { return }
+    if ($family.Count -eq 0) { return }
 
     $cur = $null
     foreach ($p in @($w.Panes)) { if ($null -ne $p) { $cur = $p; break } }
@@ -2730,6 +2787,30 @@ function Sync-SettingsSurface($w) {
                 $rootTop = ($live -match 'com\.android\.settings/\.Settings$')
             }
         }
+    }
+
+    # Activity Embedding opens a detail in a second freeform window that can
+    # be wider than the list. Match the surface against the top activity's
+    # Android frame instead of assuming the base window size; fall back to
+    # the base size while the frame is not known yet.
+    $topFrame = $null
+    try { $topFrame = $w.SettingsFrame } catch { }
+    $candidates = @()
+    if ($null -ne $topFrame -and [int]$topFrame.W -gt 100 -and [int]$topFrame.H -gt 100) {
+        foreach ($wnd in $family) {
+            if ([math]::Abs($wnd.Width - ([int]$topFrame.W + 24)) -le 48 -and
+                [math]::Abs($wnd.Height - ([int]$topFrame.H + 24)) -le 48) { $candidates += $wnd }
+        }
+    }
+    if ($candidates.Count -eq 0) {
+        foreach ($wnd in $family) {
+            if ([math]::Abs($wnd.Width - $tw) -le 48 -and [math]::Abs($wnd.Height - $th) -le 48) { $candidates += $wnd }
+        }
+    }
+    if ($candidates.Count -eq 0) {
+        # Unknown size: the topmost family window still beats freezing on a
+        # stale picture.
+        $candidates = $family
     }
 
     $active = $candidates[0]
@@ -2834,13 +2915,23 @@ function Sync-SettingsSurface($w) {
     }
     $parkedEx = (($ex -bor 0x00000080) -band (-bnot 0x00040000))
     [void][NativeWin]::SetWindowLong($active.Hwnd, -20, $parkedEx)
+    # Use the top activity's Android frame for this pane: Activity Embedding
+    # can make it wider than the base list window. Keep the previous frame
+    # only when Android did not report one.
+    $frameW = [int]$w.FrameW; $frameH = [int]$w.FrameH
+    $al = [int]$w.FrameL; $at = [int]$w.FrameT
+    if ($null -ne $topFrame -and [int]$topFrame.W -gt 100 -and [int]$topFrame.H -gt 100 -and
+        [math]::Abs([int]$active.Width - ([int]$topFrame.W + 24)) -le 48) {
+        $frameW = [int]$topFrame.W; $frameH = [int]$topFrame.H
+        $al = [int]$topFrame.L; $at = [int]$topFrame.T
+    }
     # Android sets a 12 px surface inset on each side of the Settings base
     # window. If WSLg made it content-sized, grow it back so the full 464 px
     # content is rendered instead of clipped at the right edge.
     $parkW = [int]$active.Width; $parkH = [int]$active.Height
     $isBaseWin = ([NativeWin]::GetWindow($active.Hwnd, 4) -eq [IntPtr]::Zero)
-    if ($isBaseWin -and ($parkW -lt [int]$w.FrameW + 16 -or $parkH -lt [int]$w.FrameH + 16)) {
-        $parkW = [int]$w.FrameW + 24; $parkH = [int]$w.FrameH + 24
+    if ($isBaseWin -and ($parkW -lt $frameW + 16 -or $parkH -lt $frameH + 16)) {
+        $parkW = $frameW + 24; $parkH = $frameH + 24
     }
     [void][NativeWin]::SetWindowPos($active.Hwnd, [IntPtr]::Zero, $parkBase, 0, $parkW, $parkH, 0x0010)
     if ($parkW -ne [int]$active.Width -or $parkH -ne [int]$active.Height) {
@@ -2851,15 +2942,49 @@ function Sync-SettingsSurface($w) {
 
     # The Android frame keeps its origin. Find the content rectangle inside
     # the WSLg surface so shadow margins never leak into the wrapper image.
-    $off = Get-WindowContentOffset $active.Hwnd ([int]$active.Width) ([int]$active.Height) ([int]$w.FrameW) ([int]$w.FrameH)
+    $off = Get-WindowContentOffset $active.Hwnd ([int]$active.Width) ([int]$active.Height) $frameW $frameH
     $cropX = 0; $cropY = 0
     if ($null -ne $off) {
         $cropX = [int]$off[0]; $cropY = [int]$off[1]
     } else {
-        if ([int]$active.Width -ge [int]$w.FrameW + 8) { $cropX = [int][Math]::Round(([int]$active.Width - [int]$w.FrameW) / 2) }
-        if ([int]$active.Height -ge [int]$w.FrameH + 8) { $cropY = [int][Math]::Round(([int]$active.Height - [int]$w.FrameH) / 2) }
+        if ([int]$active.Width -ge $frameW + 8) { $cropX = [int][Math]::Round(([int]$active.Width - $frameW) / 2) }
+        if ([int]$active.Height -ge $frameH + 8) { $cropY = [int][Math]::Round(([int]$active.Height - $frameH) / 2) }
     }
-    $al = [int]$w.FrameL; $at = [int]$w.FrameT
+
+    # Follow the new window size with the wrapper canvas. The Windows window
+    # keeps its user-chosen size; the image is letterboxed by Uniform stretch
+    # and Map-WrapperPoint uses the same SrcW/SrcH, so taps stay accurate.
+    if ([int]$w.SrcW -ne $frameW -or [int]$w.SrcH -ne $frameH) {
+        $w.SrcW = $frameW; $w.SrcH = $frameH
+        $wb = New-Object System.Windows.Media.Imaging.WriteableBitmap($frameW, $frameH, 96, 96, [System.Windows.Media.PixelFormats]::Bgr32, $null)
+        $w.Wb = $wb
+        $w.Image.Source = $wb
+        try { Write-WinoidLog "wrapper canvas $($w.Package): ${frameW}x${frameH}" } catch { }
+        # Keep the picture filling the window instead of a small band with
+        # black letterbox bars: preserve the current width and derive the
+        # height from the new aspect, clamped to the working area.
+        try {
+            $wa = [System.Windows.Forms.Screen]::FromHandle(
+                [System.Windows.Interop.WindowInteropHelper]::new($w.Window).Handle).WorkingArea
+            $navH = [int]$script:wrapperNavHeight + 39
+            $cw2 = [int]$w.Window.ActualWidth
+            if ($cw2 -lt 400) { $cw2 = 400 }
+            $ch2 = [int]($cw2 * $frameH / $frameW) + $navH
+            $maxH = [Math]::Max(320, $wa.Height - 64)
+            if ($ch2 -gt $maxH) {
+                $ch2 = $maxH
+                $cw2 = [int](($ch2 - $navH) * $frameW / $frameH)
+            }
+            $maxW = [Math]::Max(420, $wa.Width - 24)
+            if ($cw2 -gt $maxW) {
+                $cw2 = $maxW
+                $ch2 = [int]($cw2 * $frameH / $frameW) + $navH
+            }
+            $w.Window.Width = [Math]::Max(420, $cw2)
+            $w.Window.Height = [Math]::Max(320, $ch2)
+        } catch { }
+    }
+    $w.FrameL = $al; $w.FrameT = $at; $w.FrameW = $frameW; $w.FrameH = $frameH
 
     $pane = [pscustomobject]@{ Source = $active.Hwnd; Left = 0; Top = 0; W = [int]$active.Width; H = [int]$active.Height }
     $pane | Add-Member -NotePropertyName CropX -NotePropertyValue $cropX -Force
@@ -3193,10 +3318,13 @@ function New-AppWrapper($app, [IntPtr]$source, $size, $frames = $null) {
     $w.SettingsH = $srcH
     $w.SettingsSyncAt = [DateTime]::MinValue
     # A new Settings wrapper always starts on the root list, even if a stale
-    # sub-surface from an earlier session is still above it.
+    # sub-surface from an earlier session is still above it. Probe Android
+    # right away: after a detail was visited once, Settings restores it in a
+    # second, wider embedded window and the wrapper must follow that window.
     $w.SettingsTop = 'com.android.settings/.Settings'
-    $w.SettingsTopDue = $null
+    $w.SettingsTopDue = [DateTime]::UtcNow
     $w.SettingsTopProbeAt = $null
+    $w.SettingsFrame = $null
     $w.FrameL = 0; $w.FrameT = 0; $w.FrameW = $srcW; $w.FrameH = $srcH
     if ($null -ne $settingsFrame) {
         $w.FrameL = [int]$settingsFrame.L
@@ -4178,7 +4306,10 @@ $launchTimer.Add_Tick({
     # command. Waking a frozen container briefly starts the app at the old
     # display size; wrapping that first surface would give the wrong geometry.
     if ($st.Prepared) {
-        $h = [NativeWin]::FindWindowContains($st.WindowMatch, 'Winoid')
+        # Only WSLg's Android surfaces are valid wrapper sources. Searching by
+        # title alone once adopted Windows 11 Settings (also "Настройки") and
+        # showed it under the Android Settings wrapper.
+        $h = [NativeWin]::FindWindowContains($st.WindowMatch, 'Winoid', 'msrdc', 'RAIL_WINDOW')
         if ($h -ne [IntPtr]::Zero) {
             $st.Hwnd = $h
             if (-not $st.Wrapped) {
@@ -5473,12 +5604,14 @@ function Start-StartupProbe {
     if ($null -ne $script:startupJob) { return }
     $script:startupJob = Start-Job -ScriptBlock {
         param([string]$Wsl, [string]$Distro)
-        function Invoke-W([string[]]$Args, [int]$Ms) {
+        function Invoke-W([string[]]$Arguments, [int]$Ms) {
             $psi = [System.Diagnostics.ProcessStartInfo]::new()
             $psi.FileName = $Wsl
-            foreach ($a in $Args) { [void]$psi.ArgumentList.Add($a) }
+            foreach ($a in $Arguments) { [void]$psi.ArgumentList.Add($a) }
             $psi.UseShellExecute = $false; $psi.CreateNoWindow = $true
             $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
+            $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+            $psi.StandardErrorEncoding = [System.Text.Encoding]::UTF8
             $p = [System.Diagnostics.Process]::Start($psi)
             $o = $p.StandardOutput.ReadToEndAsync(); $e = $p.StandardError.ReadToEndAsync()
             if (-not $p.WaitForExit($Ms)) { try { $p.Kill() } catch { }; return @{ Out = ''; Err = 'timeout' } }

@@ -69,6 +69,9 @@ Assert-True ($text.Contains('Get-LaunchCommand')) 'launch uses an explicitly res
 Assert-True ($text.Contains('waydroid app launch $pkg')) 'app is launched through the Waydroid session so a window is exported'
 Assert-True ($text.Contains('function Start-AppWindow')) 'launch falls back to the resolved activity'
 Assert-True ($text.Contains('launch frames for $pkg')) 'launch job collects Android window frames for tap mapping'
+Assert-True (-not $text.Contains('[string[]]$Args')) 'WSL jobs avoid the reserved $Args parameter name'
+Assert-True ($text.Contains('[string[]]$Arguments, [int]$Ms')) 'WSL job helpers keep their argument list'
+Assert-True ($text.Contains('Localized Android labels are UTF-8')) 'app list decodes localized Android labels as UTF-8'
 Assert-True ($text.Contains('New-AppWrapper $st.App $h $st.Size $stFrames')) 'wrapper uses frames collected by the launch job'
 Assert-True ($text.Contains('full-size sub-surface')) 'duplicate full-size game surfaces are parked instead of left on the desktop'
 Assert-True ($text.Contains('$script:frameTick % 20')) 'inactive wrapper capture uses a time-based throttle'
@@ -121,6 +124,17 @@ Assert-True ($launcherSrc.Contains('fastFailures')) 'watchdog stops a crash loop
 # 5. VBScript fallback keeps Windows-compliant quoting
 $vbs = Get-Content -LiteralPath (Join-Path $root 'Winoid.vbs') -Raw
 Assert-True ($vbs.Contains('slashes * 2 + 1') -or $vbs.Contains('double')) 'VBS quote helper handles backslashes and quotes'
+
+# 6. Settings follows the top activity even in a wider embedded window
+Assert-True ($text.Contains('function Get-AndroidActivityFrame')) 'the top Settings activity frame is resolved from dumpsys'
+Assert-True ($text.Contains('settings top $top frame=')) 'the top activity and its frame are logged together'
+Assert-True ($text.Contains('Activity Embedding opens a detail in a second freeform window')) 'embedding windows are matched by the top activity frame'
+Assert-True ($text.Contains('$w.SettingsTopDue = [DateTime]::UtcNow')) 'a new Settings wrapper probes the top activity immediately'
+Assert-True ($text.Contains('wrapper canvas $($w.Package)')) 'the canvas follows a wider Settings detail window'
+Assert-True ($text.Contains('Map-WrapperPoint uses the same SrcW/SrcH')) 'tap mapping uses the updated canvas size'
+Assert-True ($text.Contains("FindWindowContains(`$st.WindowMatch, 'Winoid', 'msrdc', 'RAIL_WINDOW')")) 'launch accepts only WSLg Android surfaces'
+Assert-True ($text.Contains('Process.GetProcessById((int)pid).ProcessName')) 'launch window picker checks the owning process'
+Assert-True ($text.Contains('GetClassName(h, cs, 256)')) 'launch window picker checks the RAIL window class'
 
 Write-Host ""
 if ($failures -eq 0) { Write-Host 'ALL TESTS PASSED'; exit 0 }
